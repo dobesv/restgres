@@ -44,8 +44,9 @@
 #include "utils/snapmgr.h"
 #include "tcop/utility.h"
 #include "libpq/libpq.h"
-#include "pthread.h"
 #include "postmaster/postmaster.h"
+#include "catalog/pg_database.h"
+
 #include "evsql.h"
 
 #include <event2/event.h>
@@ -68,14 +69,164 @@ static int restgres_listen_port = 0;
 static char *restgres_listen_addresses = 0;
 static int restgres_max_connections = 0;
 
+struct evsql_conn {
+	const char *conninfo;
+	struct evsql *evsql;
+};
+
+// List of evsql instances, we need a separate one for each set of credentials
+// since once connected we cannot change the credentials.
+static List *evsql_list = NIL;
+
 #define MAXLISTEN 64
 struct evhttp_bound_socket *listen_handles[MAXLISTEN];
 
-static void
-restgres_http_cb(struct evhttp_request *req, void *arg);
+static void restgres_http_cb(struct evhttp_request *req, void *arg);
+static struct evsql *evsql_for_request(struct evhttp_request *req, const char *database);
 
 const char *path_starts_with(const char *name, const char *path);
 
+/*
+ * Escape quotes in the string, if there are any.  If not, returns the original string.  Any
+ * new string returned is allocated using palloc, which means it will be freed at the end of the request
+ * processing.
+ */
+static
+const char *_escape_quotes(const char *input, char q)
+{
+	int len = 1;
+	int quotes = 0;
+	char *output;
+	const char *a;
+	char *b;
+
+	if(input == NULL)
+		return NULL;
+	for(const char *p=input; *p; p++)
+	{
+		if(*p == q) len++;
+		len ++;
+		quotes ++;
+	}
+
+	if(quotes == 0)
+		return input;
+
+	b = output = palloc(len);
+	for(a = input; *a; a++, b++)
+	{
+		if(*a == q)
+		{
+			*b = '\\';
+			b++;
+		}
+		*b = *a;
+	}
+	return output;
+}
+
+static
+const char *_escape_single_quotes(const char *input)
+{
+	return _escape_quotes(input, '\'');
+}
+
+static
+const char *_escape_double_quotes(const char *input)
+{
+	return _escape_quotes(input, '"');
+}
+
+static struct evsql *evsql_for_params(struct event_base *base, const char *user, const char *password, const char *client_encoding, const char *database)
+{
+	struct evsql *evsql = NULL;
+	const char *database_hdr;
+	struct evsql_conn *conn;
+	char *conninfo=NULL;
+	ListCell   *l;
+	StringInfoData str;
+
+	user = _escape_single_quotes(user);
+	password = _escape_single_quotes(password);
+	client_encoding = _escape_single_quotes(client_encoding);
+	database = _escape_single_quotes(database);
+
+	if(!(database_hdr && *database_hdr)) database_hdr = user;
+
+	initStringInfo(&str);
+	if(user) appendStringInfo(&str, "user='%s' password='%s' ", user, password?password:"");
+	appendStringInfo(&str, "client_encoding='%s' database='%s'", client_encoding, database_hdr);
+	conninfo = str.data;
+
+	foreach(l, evsql_list)
+	{
+		conn = lfirst(l);
+		if(strcmp(conn->conninfo, conninfo) == 0)
+		{
+			conninfo = NULL;
+			evsql = conn->evsql;
+			break;
+		}
+
+	}
+
+	if (!evsql)
+	{
+		conn = calloc(1, sizeof(*conn));
+		conn->evsql = evsql = evsql_new_pq(base, conninfo, NULL, NULL);
+		conn->conninfo = strdup(conninfo); // Have to strdup since conninfo will be freed automatically
+		lcons(conn, evsql_list);
+	}
+
+	pfree(str.data);
+
+	return evsql;
+}
+
+
+/* Get or open a new connection for the given request */
+static struct evsql *evsql_for_request(struct evhttp_request *req, const char *database)
+{
+	struct evkeyvalq *headers;
+	const char *user;
+	const char *password;
+	const char *client_encoding;
+	struct event_base *base;
+
+	headers = evhttp_request_get_input_headers(req);
+	user = _escape_single_quotes(evhttp_find_header(headers, "x-postgresql-user"));
+	password = _escape_single_quotes(evhttp_find_header(headers, "x-postgresql-password"));
+	client_encoding = "utf8";
+	base = evhttp_connection_get_base(evhttp_request_get_connection(req));
+	return evsql_for_params(base, user, password, client_encoding, database);
+}
+
+static bool is_logged_in(struct evhttp_request *req, const char *database)
+{
+	struct evkeyvalq *headers;
+	const char *password;
+	Port port = {0};
+	struct evhttp_connection *conn;
+	const struct sockaddr *remote_addr;
+	char *client_address;
+	ev_uint16_t client_port;
+
+	headers = evhttp_request_get_input_headers(req);
+	port.user_name = (char *)evhttp_find_header(headers, "x-postgresql-user");
+	password = evhttp_find_header(headers, "x-postgresql-password");
+
+	conn = evhttp_request_get_connection(req);
+
+	remote_addr = evhttp_connection_get_addr(conn);
+	if(remote_addr)
+		memcpy(&port.raddr.addr, remote_addr, sizeof port.raddr.addr);
+
+	evhttp_connection_get_peer(conn, &port.remote_host, &client_port);
+
+	hba_getauthmethod(&port);
+
+	return STATUS_OK == md5_crypt_verify(&port, port.user_name, password);
+}
 /*
  * Signal handler for SIGTERM
  *		Set a flag to let the main loop to terminate, and set our latch to wake
@@ -188,20 +339,24 @@ initialize_restgres(struct event_base *base)
 /* Check whether the input starts with the given path component; returns the remainder of the string if so */
 const char *path_starts_with(const char *name, const char *path)
 {
-	while(*name && *path && *name == *path)
+	while(*name == *path)
 	{
+		if(*path == 0)
+			return path;
 		name++;
 		path++;
+		if(*name == 0 && *path == '/')
+			return path+1;
 	}
 
 	/* Matched if we reached the end of both strings, or the end of name and a '/' in path */
-	if (*name == 0 && (*path == '/' || *path == 0))
+	if (*name == *path)
 		return path;
 	return NULL;
 }
 
 static void
-send_server_meta(struct evhttp_request *req)
+resource_root_GET(struct evhttp_request *req)
 {
 	struct evbuffer *databuf;
 	databuf = evbuffer_new();
@@ -223,7 +378,79 @@ resource_root(struct evhttp_request *req)
 {
 	switch (evhttp_request_get_command(req)) {
 	case EVHTTP_REQ_GET:
-		send_server_meta(req);
+		resource_root_GET(req);
+		return;
+	default:
+		evhttp_send_error(req, 405, "Method not supported");
+		return;
+	}
+}
+
+static void
+resource_databases_GET_json(struct evhttp_request *req)
+{
+	int			ret;
+	HeapTuple	spi_tuple;
+	SPITupleTable *spi_tuptable = SPI_tuptable;
+	TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
+	const char *datname;
+	struct evbuffer *buf;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "listing databases");
+
+	buf = evbuffer_new();
+	evbuffer_add_printf(buf, "{ \"databases\":\n    [");
+
+	ret = SPI_execute("SELECT datname FROM pg_database WHERE datistemplate = false;", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(FATAL, "SPI_execute failed: error code %d", ret);
+	char *nl = "";
+	for(int i=0; i < SPI_processed; i++)
+	{
+		spi_tuptable = SPI_tuptable;
+		spi_tupdesc = spi_tuptable->tupdesc;
+		spi_tuple = SPI_tuptable->vals[i];
+		datname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
+		elog(LOG, "Found database '%s'", datname);
+		evbuffer_add_printf(buf, "%s{ \"name\":\"%s\" }", nl, _escape_double_quotes(datname));
+		nl = ",\n    ";
+	}
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+
+
+	evbuffer_add_printf(buf, "%s]\n}\n", nl);
+	evhttp_add_header(evhttp_request_get_output_headers(req),
+	    "Server", "RESTgres");
+	evhttp_add_header(evhttp_request_get_output_headers(req),
+	    "Content-Type", "application/json; charset=utf8");
+	evhttp_send_reply(req, 200, "OK", buf);
+	evbuffer_free(buf);
+
+}
+
+static void
+resource_databases_GET(struct evhttp_request *req)
+{
+	// TODO Content-type negotiation
+	resource_databases_GET_json(req);
+}
+
+static void
+resource_databases(struct evhttp_request *req)
+{
+	switch (evhttp_request_get_command(req)) {
+	case EVHTTP_REQ_GET:
+		resource_databases_GET(req);
+		return;
+	default:
+		evhttp_send_error(req, 405, "Method not supported");
 		return;
 	}
 }
@@ -233,22 +460,15 @@ handle_request(struct evhttp_request *req, struct evhttp_uri* uri)
 {
 	const char *path;
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-
 	path = evhttp_uri_get_path(uri);
 	if(!path || *path == 0 || strcmp("/", path) == 0)
-	{
 		resource_root(req);
-	}
-	else
-	{
+	else if(strcmp("/databases", path) == 0)
+		resource_databases(req);
+	else {
+		elog(LOG, "Path matching failed at the root: '%s'", path);
 		evhttp_send_error(req, 404, "Not found");
 	}
-
-	PopActiveSnapshot();
-	CommitTransactionCommand();
 }
 static void
 restgres_http_cb(struct evhttp_request *req, void *arg)
@@ -302,13 +522,15 @@ restgres_http_cb(struct evhttp_request *req, void *arg)
 	}
 	evhttp_send_reply(req, 200, "OK", NULL);
 
+	// Is this the right thing to do here?
+	MemoryContextReset(CurrentMemoryContext);
+
 }
 
 static void
 restgres_main(Datum main_arg)
 {
-
-	struct event_base 	*base;
+	static struct event_base 	*base;
 
 	base = event_base_new();
 	if (!base)
