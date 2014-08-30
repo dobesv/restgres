@@ -22,6 +22,7 @@
  */
 #define sigjmp_buf jmp_buf
 #include "setjmp.h"
+#include "unistd.h"
 
 #include "postgres.h"
 
@@ -42,8 +43,10 @@
 #include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
+#include "utils/memutils.h"
 #include "tcop/utility.h"
 #include "libpq/libpq.h"
+#include "libpq/crypt.h"
 #include "postmaster/postmaster.h"
 #include "catalog/pg_database.h"
 
@@ -113,15 +116,17 @@ const char *_escape_quotes(const char *input, char q)
 		return input;
 
 	b = output = palloc(len);
-	for(a = input; *a; a++, b++)
+	for(a = input; *a; a++)
 	{
-		if(*a == q)
+		if(*a == q || *a == '\\')
 		{
 			*b = '\\';
 			b++;
 		}
 		*b = *a;
+		b++;
 	}
+	*b = 0;
 	return output;
 }
 
@@ -201,32 +206,62 @@ static struct evsql *evsql_for_request(struct evhttp_request *req, const char *d
 	return evsql_for_params(base, user, password, client_encoding, database);
 }
 
+static bool is_anonymous(struct evhttp_request *req)
+{
+	struct evkeyvalq *headers;
+	const char *user_name;
+	headers = evhttp_request_get_input_headers(req);
+	user_name = evhttp_find_header(headers, "x-postgresql-user");
+	return user_name == NULL;
+}
 static bool is_logged_in(struct evhttp_request *req, const char *database)
 {
 	struct evkeyvalq *headers;
 	const char *password;
 	Port port = {0};
 	struct evhttp_connection *conn;
-	const struct sockaddr *remote_addr;
-	char *client_address;
 	ev_uint16_t client_port;
+	int sockaddrlen = sizeof port.raddr.addr;
+	int rc;
 
 	headers = evhttp_request_get_input_headers(req);
 	port.user_name = (char *)evhttp_find_header(headers, "x-postgresql-user");
 	password = evhttp_find_header(headers, "x-postgresql-password");
-
+	if(port.user_name == NULL)
+	{
+		elog(LOG, "Request is not authentication, no username provided.");
+		return false;
+	}
+	if(password == NULL) password = "";
 	conn = evhttp_request_get_connection(req);
-
-	remote_addr = evhttp_connection_get_addr(conn);
-	if(remote_addr)
-		memcpy(&port.raddr.addr, remote_addr, sizeof port.raddr.addr);
-
 	evhttp_connection_get_peer(conn, &port.remote_host, &client_port);
-
+	evutil_parse_sockaddr_port(port.remote_host, (struct sockaddr *)&port.raddr.addr, &sockaddrlen);
 	hba_getauthmethod(&port);
 
-	return STATUS_OK == md5_crypt_verify(&port, port.user_name, password);
+	rc = md5_crypt_verify(&port, port.user_name, (char *)password);
+	elog(LOG, "Calling md5_crypt_verify with username '%s' password '%s' returned %d", port.user_name, password, rc);
+	return rc == STATUS_OK;
 }
+
+static bool
+require_logged_in(struct evhttp_request *req, const char *database)
+{
+	if(is_anonymous(req))
+	{
+		evhttp_send_error(req, 403, "You must log in to view database information");
+		return false;
+	}
+	else if(is_logged_in(req, database))
+	{
+		return true;
+	}
+	else
+	{
+		evhttp_send_error(req, 403, "Bad credentials");
+		return false;
+	}
+}
+
 /*
  * Signal handler for SIGTERM
  *		Set a flag to let the main loop to terminate, and set our latch to wake
@@ -395,12 +430,7 @@ resource_databases_GET_json(struct evhttp_request *req)
 	TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
 	const char *datname;
 	struct evbuffer *buf;
-
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	pgstat_report_activity(STATE_RUNNING, "listing databases");
+	char *nl = "";
 
 	buf = evbuffer_new();
 	evbuffer_add_printf(buf, "{ \"databases\":\n    [");
@@ -408,7 +438,6 @@ resource_databases_GET_json(struct evhttp_request *req)
 	ret = SPI_execute("SELECT datname FROM pg_database WHERE datistemplate = false;", true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(FATAL, "SPI_execute failed: error code %d", ret);
-	char *nl = "";
 	for(int i=0; i < SPI_processed; i++)
 	{
 		spi_tuptable = SPI_tuptable;
@@ -419,10 +448,6 @@ resource_databases_GET_json(struct evhttp_request *req)
 		evbuffer_add_printf(buf, "%s{ \"name\":\"%s\" }", nl, _escape_double_quotes(datname));
 		nl = ",\n    ";
 	}
-
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	pgstat_report_activity(STATE_IDLE, NULL);
 
 
 	evbuffer_add_printf(buf, "%s]\n}\n", nl);
@@ -445,13 +470,40 @@ resource_databases_GET(struct evhttp_request *req)
 static void
 resource_databases(struct evhttp_request *req)
 {
-	switch (evhttp_request_get_command(req)) {
-	case EVHTTP_REQ_GET:
-		resource_databases_GET(req);
-		return;
-	default:
-		evhttp_send_error(req, 405, "Method not supported");
-		return;
+	if(require_logged_in(req, "postgres"))
+	{
+		switch (evhttp_request_get_command(req))
+		{
+		case EVHTTP_REQ_GET:
+			resource_databases_GET(req);
+			return;
+		default:
+			evhttp_send_error(req, 405, "Method not supported");
+			return;
+		}
+	}
+}
+
+static void
+resource_database_GET(struct evhttp_request *req, const char *database)
+{
+	evhttp_send_error(req, 405, "Database metadata not implemented yet.");
+}
+
+static void
+resource_database(struct evhttp_request *req, const char *database)
+{
+	if(require_logged_in(req, database))
+	{
+		switch (evhttp_request_get_command(req))
+		{
+		case EVHTTP_REQ_GET:
+			resource_database_GET(req, database);
+			return;
+		default:
+			evhttp_send_error(req, 405, "Method not supported");
+			return;
+		}
 	}
 }
 
@@ -464,8 +516,22 @@ handle_request(struct evhttp_request *req, struct evhttp_uri* uri)
 	if(!path || *path == 0 || strcmp("/", path) == 0)
 		resource_root(req);
 	else if(strcmp("/databases", path) == 0)
+	{
 		resource_databases(req);
-	else {
+	}
+	else if(strncmp("/databases/", path, strlen("/databases/")) == 0)
+	{
+		// Starts with /databases/ ...
+		const char *db_start = path + strlen("/databases/");
+		const char *db_end = strchr(db_start, '/');
+		if(db_end == NULL)
+			resource_database(req, db_start);
+		else
+			evhttp_send_error(req, 404, "Not implemented yet - stuff inside a database");
+
+	}
+	else
+	{
 		elog(LOG, "Path matching failed at the root: '%s'", path);
 		evhttp_send_error(req, 404, "Not found");
 	}
@@ -478,7 +544,20 @@ restgres_http_cb(struct evhttp_request *req, void *arg)
 	struct evkeyval *header;
 	struct evbuffer *buf;
 	struct evhttp_uri* uri;
+	MemoryContext oldcontext;
+	MemoryContext context;
 
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "Handling request");
+	context = AllocSetContextCreate(CurrentMemoryContext,
+			 "request temporary context",
+			 ALLOCSET_DEFAULT_MINSIZE,
+			 ALLOCSET_DEFAULT_INITSIZE,
+			 ALLOCSET_DEFAULT_MAXSIZE);
+	oldcontext = MemoryContextSwitchTo(context);
 	switch (evhttp_request_get_command(req)) {
 	case EVHTTP_REQ_GET: cmdtype = "GET"; break;
 	case EVHTTP_REQ_POST: cmdtype = "POST"; break;
@@ -522,9 +601,12 @@ restgres_http_cb(struct evhttp_request *req, void *arg)
 	}
 	evhttp_send_reply(req, 200, "OK", NULL);
 
-	// Is this the right thing to do here?
-	MemoryContextReset(CurrentMemoryContext);
-
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+	MemoryContextReset(context);
+	MemoryContextSwitchTo(oldcontext);
 }
 
 static void
@@ -553,7 +635,7 @@ restgres_main(Datum main_arg)
 
 	initialize_restgres(base);
 
-	elog(LOG, "RESTgres initialized, port %d, listen_addresses = \"%s\"", restgres_listen_port, restgres_listen_addresses);
+	elog(LOG, "RESTgres initialized, pid %d port %d listen_addresses \"%s\"", getpid(), restgres_listen_port, restgres_listen_addresses);
 
 	event_base_dispatch(base);
 
