@@ -216,22 +216,27 @@ static bool is_anonymous(struct evhttp_request *req)
 	user_name = evhttp_find_header(headers, "x-postgresql-user");
 	return user_name == NULL;
 }
-static const char *is_logged_in(struct evhttp_request *req,
-		const char *database)
+static const char *is_logged_in(struct evhttp_request *req, const char *database)
 {
 	struct evkeyvalq *headers;
 	const char *password;
-	Port _port =
-	{ 0 };
+	Port _port = { 0 };
 	Port *port = &_port;
 	struct evhttp_connection *conn;
 	ev_uint16_t client_port;
 	int sockaddrlen = sizeof _port.raddr.addr;
 	int rc = STATUS_ERROR;
 	char *logdetail = "auth failed";
+	const char *user_name;
 
 	headers = evhttp_request_get_input_headers(req);
-	port->user_name = (char *) evhttp_find_header(headers, "x-postgresql-user");
+	user_name = port->user_name = (char *) evhttp_find_header(headers, "x-postgresql-user");
+	if(user_name == NULL)
+	{
+		logdetail = "No username provided.";
+		return false;
+	}
+
 	password = evhttp_find_header(headers, "x-postgresql-password");
 	conn = evhttp_request_get_connection(req);
 	evhttp_connection_get_peer(conn, &_port.remote_host, &client_port);
@@ -381,10 +386,18 @@ static const char *is_logged_in(struct evhttp_request *req,
 		break;
 	}
 
-	return rc == STATUS_OK;
+	if(rc == STATUS_OK)
+	{
+		return user_name;
+	}
 }
 
-static bool require_logged_in(struct evhttp_request *req, const char *database)
+/*
+ * Check if the user is logged in; if so, return their username.  If not, return
+ * NULL and send an error response.  The username will be deallocated along with the
+ * request.
+ */
+static const char *require_logged_in(struct evhttp_request *req, const char *database)
 {
 	if (is_anonymous(req))
 	{
@@ -392,15 +405,15 @@ static bool require_logged_in(struct evhttp_request *req, const char *database)
 				"You must log in to view database information");
 		return false;
 	}
-	else if (is_logged_in(req, database))
-	{
-		return true;
-	}
-	else
+
+	const char *user_name = is_logged_in(req, database);
+	if (user_name == NULL)
 	{
 		evhttp_send_error(req, 403, "Bad credentials");
 		return false;
 	}
+
+	return true;
 }
 
 /*
@@ -574,7 +587,6 @@ static void resource_databases_GET_json(struct evhttp_request *req)
 			spi_tupdesc = spi_tuptable->tupdesc;
 			spi_tuple = SPI_tuptable->vals[i];
 			datname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-			elog(LOG, "Found database '%s'", datname);
 			escape_json(name_buf, datname);
 			evbuffer_add_cstring(buf, i == 0 ? "\n    " : ",\n    ");
 			evbuffer_add_cstring(buf, "{ \"name\":");
@@ -602,7 +614,8 @@ static void resource_databases_GET(struct evhttp_request *req)
 
 static void resource_databases(struct evhttp_request *req)
 {
-	if (require_logged_in(req, "postgres"))
+	const char *user_name;
+	if ((user_name = require_logged_in(req, "postgres")) != NULL)
 	{
 		switch (evhttp_request_get_command(req))
 		{
@@ -616,15 +629,35 @@ static void resource_databases(struct evhttp_request *req)
 	}
 }
 
-static void resource_database_GET(struct evhttp_request *req,
-		const char *database)
+static void resource_database_GET(struct evhttp_request *req, const char *database)
 {
+	/*
+	 * Desired fields:
+	 *
+	 * name
+	 * oid
+	 * owner
+	 * acl
+	 * tablespace
+	 * default tablespace
+	 * encoding
+	 * collation
+	 * character type
+	 * default schema
+	 * default table acl
+	 * default sequence acl
+	 * default function acl
+	 * default type acl
+	 * system database?
+	 * comment
+	 */
 	evhttp_send_error(req, 405, "Database metadata not implemented yet.");
 }
 
 static void resource_database(struct evhttp_request *req, const char *database)
 {
-	if (require_logged_in(req, database))
+	const char *user_name;
+	if ((user_name = require_logged_in(req, database)) != NULL)
 	{
 		switch (evhttp_request_get_command(req))
 		{
