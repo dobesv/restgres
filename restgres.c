@@ -47,10 +47,9 @@
 #include "tcop/utility.h"
 #include "libpq/libpq.h"
 #include "libpq/crypt.h"
+#include "libpq/ip.h"
 #include "postmaster/postmaster.h"
 #include "catalog/pg_database.h"
-
-#include "evsql.h"
 
 #include <event2/event.h>
 #include <event2/http.h>
@@ -72,22 +71,12 @@ static int restgres_listen_port = 0;
 static char *restgres_listen_addresses = 0;
 static int restgres_max_connections = 0;
 
-struct evsql_conn {
-	const char *conninfo;
-	struct evsql *evsql;
-};
-
-// List of evsql instances, we need a separate one for each set of credentials
-// since once connected we cannot change the credentials.
-static List *evsql_list = NIL;
-
 #define MAXLISTEN 64
 struct evhttp_bound_socket *listen_handles[MAXLISTEN];
 
 static void restgres_http_cb(struct evhttp_request *req, void *arg);
-static struct evsql *evsql_for_request(struct evhttp_request *req, const char *database);
 
-const char *path_starts_with(const char *name, const char *path);
+const char *remove_prefix(const char *name, const char *path);
 
 /*
  * Escape quotes in the string, if there are any.  If not, returns the original string.  Any
@@ -130,80 +119,16 @@ const char *_escape_quotes(const char *input, char q)
 	return output;
 }
 
-static
-const char *_escape_single_quotes(const char *input)
-{
-	return _escape_quotes(input, '\'');
-}
+//static
+//const char *_escape_single_quotes(const char *input)
+//{
+//	return _escape_quotes(input, '\'');
+//}
 
 static
 const char *_escape_double_quotes(const char *input)
 {
 	return _escape_quotes(input, '"');
-}
-
-static struct evsql *evsql_for_params(struct event_base *base, const char *user, const char *password, const char *client_encoding, const char *database)
-{
-	struct evsql *evsql = NULL;
-	const char *database_hdr;
-	struct evsql_conn *conn;
-	char *conninfo=NULL;
-	ListCell   *l;
-	StringInfoData str;
-
-	user = _escape_single_quotes(user);
-	password = _escape_single_quotes(password);
-	client_encoding = _escape_single_quotes(client_encoding);
-	database = _escape_single_quotes(database);
-
-	if(!(database_hdr && *database_hdr)) database_hdr = user;
-
-	initStringInfo(&str);
-	if(user) appendStringInfo(&str, "user='%s' password='%s' ", user, password?password:"");
-	appendStringInfo(&str, "client_encoding='%s' database='%s'", client_encoding, database_hdr);
-	conninfo = str.data;
-
-	foreach(l, evsql_list)
-	{
-		conn = lfirst(l);
-		if(strcmp(conn->conninfo, conninfo) == 0)
-		{
-			conninfo = NULL;
-			evsql = conn->evsql;
-			break;
-		}
-
-	}
-
-	if (!evsql)
-	{
-		conn = calloc(1, sizeof(*conn));
-		conn->evsql = evsql = evsql_new_pq(base, conninfo, NULL, NULL);
-		conn->conninfo = strdup(conninfo); // Have to strdup since conninfo will be freed automatically
-		lcons(conn, evsql_list);
-	}
-
-	pfree(str.data);
-
-	return evsql;
-}
-
-
-/* Get or open a new connection for the given request */
-static struct evsql *evsql_for_request(struct evhttp_request *req, const char *database)
-{
-	struct evkeyvalq *headers;
-	const char *user;
-	const char *password;
-	const char *client_encoding;
-	struct event_base *base;
-
-	headers = evhttp_request_get_input_headers(req);
-	user = _escape_single_quotes(evhttp_find_header(headers, "x-postgresql-user"));
-	password = _escape_single_quotes(evhttp_find_header(headers, "x-postgresql-password"));
-	client_encoding = "utf8";
-	base = evhttp_connection_get_base(evhttp_request_get_connection(req));
-	return evsql_for_params(base, user, password, client_encoding, database);
 }
 
 static bool is_anonymous(struct evhttp_request *req)
@@ -218,28 +143,166 @@ static bool is_logged_in(struct evhttp_request *req, const char *database)
 {
 	struct evkeyvalq *headers;
 	const char *password;
-	Port port = {0};
+	Port _port = {0};
+	Port *port = &_port;
 	struct evhttp_connection *conn;
 	ev_uint16_t client_port;
-	int sockaddrlen = sizeof port.raddr.addr;
-	int rc;
+	int sockaddrlen = sizeof _port.raddr.addr;
+	int rc = STATUS_ERROR;
+	char *logdetail = "auth failed";
 
 	headers = evhttp_request_get_input_headers(req);
-	port.user_name = (char *)evhttp_find_header(headers, "x-postgresql-user");
+	port->user_name = (char *)evhttp_find_header(headers, "x-postgresql-user");
 	password = evhttp_find_header(headers, "x-postgresql-password");
-	if(port.user_name == NULL)
-	{
-		elog(LOG, "Request is not authentication, no username provided.");
-		return false;
-	}
-	if(password == NULL) password = "";
 	conn = evhttp_request_get_connection(req);
-	evhttp_connection_get_peer(conn, &port.remote_host, &client_port);
-	evutil_parse_sockaddr_port(port.remote_host, (struct sockaddr *)&port.raddr.addr, &sockaddrlen);
-	hba_getauthmethod(&port);
+	evhttp_connection_get_peer(conn, &_port.remote_host, &client_port);
+	evutil_parse_sockaddr_port(_port.remote_host, (struct sockaddr *)&_port.raddr.addr, &sockaddrlen);
 
-	rc = md5_crypt_verify(&port, port.user_name, (char *)password);
-	elog(LOG, "Calling md5_crypt_verify with username '%s' password '%s' returned %d", port.user_name, password, rc);
+	// Need to follow the logic in auth.c#ClientAuthentication
+	hba_getauthmethod(port);
+	if(!_port.hba)
+	{
+		elog(LOG, "No matching line in hba.conf for this connection, cannot authenticate.");
+		return false; // No matching HBA line found
+	}
+
+	/*
+	 * Now proceed to do the actual authentication check
+	 */
+	switch (port->hba->auth_method)
+	{
+		case uaReject:
+
+			/*
+			 * An explicit "reject" entry in pg_hba.conf.  This report exposes
+			 * the fact that there's an explicit reject entry, which is
+			 * perhaps not so desirable from a security standpoint; but the
+			 * message for an implicit reject could confuse the DBA a lot when
+			 * the true situation is a match to an explicit reject.  And we
+			 * don't want to change the message for an implicit reject.  As
+			 * noted below, the additional information shown here doesn't
+			 * expose anything not known to an attacker.
+			 */
+			{
+				char		hostinfo[NI_MAXHOST];
+
+				pg_getnameinfo_all(&port->raddr.addr, port->raddr.salen,
+								   hostinfo, sizeof(hostinfo),
+								   NULL, 0,
+								   NI_NUMERICHOST);
+
+#ifdef USE_SSL
+				ereport(FATAL,
+				   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
+						   hostinfo, port->user_name,
+						   port->database_name,
+						   port->ssl ? _("SSL on") : _("SSL off"))));
+#else
+				ereport(FATAL,
+				   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\"",
+						   hostinfo, port->user_name,
+						   port->database_name)));
+#endif
+				break;
+			}
+
+		case uaImplicitReject:
+
+			/*
+			 * No matching entry, so tell the user we fell through.
+			 *
+			 * NOTE: the extra info reported here is not a security breach,
+			 * because all that info is known at the frontend and must be
+			 * assumed known to bad guys.  We're merely helping out the less
+			 * clueful good guys.
+			 */
+			{
+				char		hostinfo[NI_MAXHOST];
+
+				pg_getnameinfo_all(&port->raddr.addr, port->raddr.salen,
+								   hostinfo, sizeof(hostinfo),
+								   NULL, 0,
+								   NI_NUMERICHOST);
+
+#define HOSTNAME_LOOKUP_DETAIL(port) \
+				(port->remote_hostname ? \
+				 (port->remote_hostname_resolv == +1 ? \
+				  errdetail_log("Client IP address resolved to \"%s\", forward lookup matches.", \
+								port->remote_hostname) : \
+				  port->remote_hostname_resolv == 0 ? \
+				  errdetail_log("Client IP address resolved to \"%s\", forward lookup not checked.", \
+								port->remote_hostname) : \
+				  port->remote_hostname_resolv == -1 ? \
+				  errdetail_log("Client IP address resolved to \"%s\", forward lookup does not match.", \
+								port->remote_hostname) : \
+				  port->remote_hostname_resolv == -2 ? \
+				  errdetail_log("Could not translate client host name \"%s\" to IP address: %s.", \
+								port->remote_hostname, \
+								gai_strerror(port->remote_hostname_errcode)) : \
+				  0) \
+				 : (port->remote_hostname_resolv == -2 ? \
+					errdetail_log("Could not resolve client IP address to a host name: %s.", \
+								  gai_strerror(port->remote_hostname_errcode)) : \
+					0))
+
+#ifdef USE_SSL
+				ereport(FATAL,
+				   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
+						   hostinfo, port->user_name,
+						   port->database_name,
+						   port->ssl ? _("SSL on") : _("SSL off")),
+					HOSTNAME_LOOKUP_DETAIL(port)));
+#else
+				ereport(FATAL,
+				   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\"",
+						   hostinfo, port->user_name,
+						   port->database_name),
+					HOSTNAME_LOOKUP_DETAIL(port)));
+#endif
+				break;
+			}
+
+		default:
+		case uaGSS:
+		case uaSSPI:
+		case uaPeer:
+		case uaIdent:
+		case uaPAM:
+		case uaLDAP:
+		case uaCert:
+		case uaRADIUS:
+			logdetail = "GSS/SSPI/UNIX domain socket/identd/PAM/LDAP/Cert/RADIUS auth support not available via HTTP (yet).";
+			rc = STATUS_ERROR;
+			break;
+
+		case uaMD5:
+//			if (Db_user_namespace)
+//				ereport(FATAL,
+//						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+//						 errmsg("MD5 authentication is not supported when \"db_user_namespace\" is enabled")));
+		case uaPassword:
+			if(password == NULL || password[0] == 0)
+			{
+				rc = STATUS_ERROR;
+				logdetail = "User did not provide a password";
+			}
+			else
+			{
+				rc = md5_crypt_verify(port, port->user_name, (char *)password, &logdetail);
+				if(rc != STATUS_OK)
+					elog(WARNING, "Password verification failed for user '%s': %s", port->user_name, logdetail?logdetail:"no detail available");
+			}
+			break;
+
+		case uaTrust:
+			rc = STATUS_OK;
+			break;
+	}
+
 	return rc == STATUS_OK;
 }
 
@@ -372,23 +435,15 @@ initialize_restgres(struct event_base *base)
 }
 
 /* Check whether the input starts with the given path component; returns the remainder of the string if so */
-const char *path_starts_with(const char *name, const char *path)
+const char *remove_prefix(const char *prefix, const char *input)
 {
-	while(*name == *path)
-	{
-		if(*path == 0)
-			return path;
-		name++;
-		path++;
-		if(*name == 0 && *path == '/')
-			return path+1;
-	}
-
-	/* Matched if we reached the end of both strings, or the end of name and a '/' in path */
-	if (*name == *path)
-		return path;
+	int len = strlen(prefix);
+	if(strncmp(prefix, input, len) == 0)
+		return input + len;
 	return NULL;
 }
+
+
 
 static void
 resource_root_GET(struct evhttp_request *req)
@@ -511,6 +566,7 @@ static void
 handle_request(struct evhttp_request *req, struct evhttp_uri* uri)
 {
 	const char *path;
+	const char *db_start;
 
 	path = evhttp_uri_get_path(uri);
 	if(!path || *path == 0 || strcmp("/", path) == 0)
@@ -518,8 +574,9 @@ handle_request(struct evhttp_request *req, struct evhttp_uri* uri)
 	else if(strcmp("/databases", path) == 0)
 	{
 		resource_databases(req);
+		return;
 	}
-	else if(strncmp("/databases/", path, strlen("/databases/")) == 0)
+	else if((db_start = remove_prefix("/databases/", path)) != NULL)
 	{
 		// Starts with /databases/ ...
 		const char *db_start = path + strlen("/databases/");
@@ -547,17 +604,19 @@ restgres_http_cb(struct evhttp_request *req, void *arg)
 	MemoryContext oldcontext;
 	MemoryContext context;
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	pgstat_report_activity(STATE_RUNNING, "Handling request");
 	context = AllocSetContextCreate(CurrentMemoryContext,
 			 "request temporary context",
 			 ALLOCSET_DEFAULT_MINSIZE,
 			 ALLOCSET_DEFAULT_INITSIZE,
 			 ALLOCSET_DEFAULT_MAXSIZE);
+	AssertArg(MemoryContextIsValid(context));
 	oldcontext = MemoryContextSwitchTo(context);
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "Handling request");
 	switch (evhttp_request_get_command(req)) {
 	case EVHTTP_REQ_GET: cmdtype = "GET"; break;
 	case EVHTTP_REQ_POST: cmdtype = "POST"; break;
@@ -599,14 +658,13 @@ restgres_http_cb(struct evhttp_request *req, void *arg)
 		if (n > 0)
 			(void) fwrite(cbuf, 1, n, stdout);
 	}
-	evhttp_send_reply(req, 200, "OK", NULL);
 
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
-	MemoryContextReset(context);
 	MemoryContextSwitchTo(oldcontext);
+	MemoryContextReset(context);
 }
 
 static void
@@ -623,8 +681,6 @@ restgres_main(Datum main_arg)
 	}
 
 	/* Establish signal handlers before unblocking signals. */
-	// pqsignal(SIGHUP, restgres_sighup);
-	// pqsignal(SIGTERM, restgres_sigterm);
 	evsignal_new(base, SIGHUP, (event_callback_fn)restgres_sighup, (void *)base);
 	evsignal_new(base, SIGTERM, (event_callback_fn)restgres_sigterm, (void *)base);
 
@@ -655,7 +711,7 @@ _PG_init(void)
 
 	/* get the configuration */
 	DefineCustomIntVariable("restgres.port",
-							"Duration between each check (in seconds).",
+							"Port to listen on (default: any available port)",
 							NULL,
 							&restgres_listen_port,
 							restgres_listen_port,
@@ -694,6 +750,7 @@ _PG_init(void)
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
 	worker.bgw_main = restgres_main;
+	worker.bgw_notify_pid = 0;
 
 	/*
 	 * Now fill in worker-specific data, and do the actual registrations.
