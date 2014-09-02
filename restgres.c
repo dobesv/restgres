@@ -78,6 +78,9 @@ static void restgres_http_cb(struct evhttp_request *req, void *arg);
 
 const char *remove_prefix(const char *name, const char *path);
 
+void
+escape_json(StringInfo buf, const char *str);
+
 /*
  * Escape quotes in the string, if there are any.  If not, returns the original string.  Any
  * new string returned is allocated using palloc, which means it will be freed at the end of the request
@@ -119,6 +122,75 @@ const char *_escape_quotes(const char *input, char q)
 	return output;
 }
 
+/*
+ * Produce a JSON string literal, properly escaping characters in the text.
+ */
+void
+escape_json(StringInfo buf, const char *str)
+{
+	const char *p;
+
+	appendStringInfoCharMacro(buf, '\"');
+	for (p = str; *p; p++)
+	{
+		switch (*p)
+		{
+			case '\b':
+				appendStringInfoString(buf, "\\b");
+				break;
+			case '\f':
+				appendStringInfoString(buf, "\\f");
+				break;
+			case '\n':
+				appendStringInfoString(buf, "\\n");
+				break;
+			case '\r':
+				appendStringInfoString(buf, "\\r");
+				break;
+			case '\t':
+				appendStringInfoString(buf, "\\t");
+				break;
+			case '"':
+				appendStringInfoString(buf, "\\\"");
+				break;
+			case '\\':
+
+				/*
+				 * Unicode escapes are passed through as is. There is no
+				 * requirement that they denote a valid character in the
+				 * server encoding - indeed that is a big part of their
+				 * usefulness.
+				 *
+				 * All we require is that they consist of \uXXXX where the Xs
+				 * are hexadecimal digits. It is the responsibility of the
+				 * caller of, say, to_json() to make sure that the unicode
+				 * escape is valid.
+				 *
+				 * In the case of a jsonb string value being escaped, the only
+				 * unicode escape that should be present is \u0000, all the
+				 * other unicode escapes will have been resolved.
+				 */
+				if (p[1] == 'u' &&
+					isxdigit((unsigned char) p[2]) &&
+					isxdigit((unsigned char) p[3]) &&
+					isxdigit((unsigned char) p[4]) &&
+					isxdigit((unsigned char) p[5]))
+					appendStringInfoCharMacro(buf, *p);
+				else
+					appendStringInfoString(buf, "\\\\");
+				break;
+			default:
+				if ((unsigned char) *p < ' ')
+					appendStringInfo(buf, "\\u%04x", (int) *p);
+				else
+					appendStringInfoCharMacro(buf, *p);
+				break;
+		}
+	}
+	appendStringInfoCharMacro(buf, '\"');
+}
+
+
 //static
 //const char *_escape_single_quotes(const char *input)
 //{
@@ -130,6 +202,15 @@ const char *_escape_double_quotes(const char *input)
 {
 	return _escape_quotes(input, '"');
 }
+
+/**
+ * Add a null-terminated string to the buffer.
+ */
+static void evbuffer_add_cstring(struct evbuffer *buf, const char *str) {
+	evbuffer_add(buf, str, strlen(str));
+}
+
+
 
 static bool is_anonymous(struct evhttp_request *req)
 {
@@ -485,27 +566,36 @@ resource_databases_GET_json(struct evhttp_request *req)
 	TupleDesc	spi_tupdesc = spi_tuptable->tupdesc;
 	const char *datname;
 	struct evbuffer *buf;
-	char *nl = "";
 
 	buf = evbuffer_new();
-	evbuffer_add_printf(buf, "{ \"databases\":\n    [");
+	evbuffer_add_printf(buf, "{\n  \"databases\": ");
 
 	ret = SPI_execute("SELECT datname FROM pg_database WHERE datistemplate = false;", true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(FATAL, "SPI_execute failed: error code %d", ret);
-	for(int i=0; i < SPI_processed; i++)
+	if(SPI_processed == 0)
+		evbuffer_add_cstring(buf, "[]\n");
+	else
 	{
-		spi_tuptable = SPI_tuptable;
-		spi_tupdesc = spi_tuptable->tupdesc;
-		spi_tuple = SPI_tuptable->vals[i];
-		datname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-		elog(LOG, "Found database '%s'", datname);
-		evbuffer_add_printf(buf, "%s{ \"name\":\"%s\" }", nl, _escape_double_quotes(datname));
-		nl = ",\n    ";
+		evbuffer_add_cstring(buf, "[");
+		for(int i=0; i < SPI_processed; i++)
+		{
+			StringInfo name_buf = makeStringInfo();
+			spi_tuptable = SPI_tuptable;
+			spi_tupdesc = spi_tuptable->tupdesc;
+			spi_tuple = SPI_tuptable->vals[i];
+			datname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
+			elog(LOG, "Found database '%s'", datname);
+			escape_json(name_buf, datname);
+			evbuffer_add_cstring(buf, i==0?"\n    ":",\n    ");
+			evbuffer_add_cstring(buf, "{ \"name\":");
+			evbuffer_add_cstring(buf, name_buf->data);
+			evbuffer_add_cstring(buf, " }");
+		}
+
+		evbuffer_add_cstring(buf, "\n  ]\n");
 	}
-
-
-	evbuffer_add_printf(buf, "%s]\n}\n", nl);
+	evbuffer_add_cstring(buf, "}\n");
 	evhttp_add_header(evhttp_request_get_output_headers(req),
 	    "Server", "RESTgres");
 	evhttp_add_header(evhttp_request_get_output_headers(req),
