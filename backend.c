@@ -155,7 +155,7 @@ add_date_header(struct evkeyvalq *headers)
 static void
 evhttp_maybe_add_content_length_header(struct evkeyvalq *headers, size_t content_length);
 static void
-evbuffer_add_http_response(int status_code, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer);
+evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer);
 static void
 evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers);
 static int
@@ -178,13 +178,13 @@ evhttp_maybe_add_content_length_header(struct evkeyvalq *headers, size_t content
 }
 
 static void
-evbuffer_add_http_response(int status_code, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer)
+evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer)
 {
 	/* Make sure we have Date and Content-Length */
 	evhttp_maybe_add_content_length_header(headers, evbuffer_get_length(reply_body));
 
 	/* TODO figure out the right HTTP version to return */
-	evbuffer_add_printf(reply_buffer, "HTTP/1.0 %d %s\r\n", status_code, http_response_phrase(status_code));
+	evbuffer_add_printf(reply_buffer, "HTTP/%s %d %s\r\n", http_ver, status_code, http_response_phrase(status_code));
 	evbuffer_add_headers(reply_buffer, headers);
 	evbuffer_add_crlf(reply_buffer);
 	evbuffer_remove_buffer(reply_body, reply_buffer, evbuffer_get_length(reply_body));
@@ -228,6 +228,7 @@ void restgres_backend_main(Datum main_arg)
 	struct evbuffer *body_buffer = evbuffer_new();
 	struct evbuffer *reply_buffer = evbuffer_new();
 	struct evbuffer *reply_body_buffer = evbuffer_new();
+	const char *http_ver;
 
 	pgsocket reply_fd = PGINVALID_SOCKET;
 
@@ -247,12 +248,21 @@ void restgres_backend_main(Datum main_arg)
 	fd = connect_to_master();
 	if(fd == -1)
 	{
-		pg_usleep(5000000);
-		proc_exit(2);
+		proc_exit(1);
 		return;
 	}
 
-	elog(LOG, "RESTgres worker initialized, pid = %d", getpid());
+	/* This must be the initial packet telling us what database to connect to */
+	dbname = read_netstring_cstring(fd, input, 1000);
+	username = read_netstring_cstring(fd, input, 1000);
+	if(dbname == NULL || username == NULL)
+	{
+		elog(FATAL, "Failed to read database and username from master");
+		proc_exit(1);
+	}
+
+	BackgroundWorkerInitializeConnection(dbname, username);
+	elog(LOG, "restgres backend worker initialized, pid = %d, user = %s, dbname = %s", getpid(), dbname, username);
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
@@ -260,6 +270,10 @@ void restgres_backend_main(Datum main_arg)
 	while (!got_sigterm)
 	{
 		int			rc;
+
+//		elog(LOG, "Sleep before WaitLatchOrSocket ...");
+//		pg_usleep(30000000);
+		elog(LOG, "About to WaitLatchOrSocket ...");
 
 		/*
 		 * Background workers mustn't call usleep() or any direct equivalent:
@@ -271,6 +285,8 @@ void restgres_backend_main(Datum main_arg)
 					   WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE,
 					   fd,
 					   0);
+		elog(LOG, "WaitLatchOrSocket returns %x", rc);
+
 		ResetLatch(&MyProc->procLatch);
 
 		/* emergency bailout if postmaster has died */
@@ -287,89 +303,77 @@ void restgres_backend_main(Datum main_arg)
 
 		if (rc & WL_SOCKET_READABLE)
 		{
-			evbuffer_read(input, fd, 65536);
+			elog(LOG, "Got something on our socket...");
 
-			if(dbname != NULL && reply_fd == PGINVALID_SOCKET)
+			if(reply_fd == PGINVALID_SOCKET)
 			{
+				elog(LOG, "Trying to read reply fd ...");
 				reply_fd = recvfd(fd);
+				elog(LOG, "Reply fd is %d", reply_fd);
 			}
-			if(evbuffer_remove_netstring_buffer(input, request_buffer) == 0)
+
+			if(read_netstring_buffer(fd, input, request_buffer, 65536) == 0)
 			{
-				if(dbname == NULL)
+				MemoryContext oldcontext = MemoryContextSwitchTo(request_context);
+				struct evkeyvalq request_headers = TAILQ_HEAD_INITIALIZER(request_headers);
+				struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(request_headers);
+				int status_code;
+
+				elog(LOG, "Trying to read scgi request in %d bytes", (int)evbuffer_get_length(request_buffer));
+
+				if(reply_fd == PGINVALID_SOCKET)
 				{
-					/* This must be the initial packet telling us what database to connect to */
-					dbname = evbuffer_remove_netstring_cstring(request_buffer);
-					username = evbuffer_remove_netstring_cstring(request_buffer);
-					if(evbuffer_get_length(request_buffer) != 0 || dbname == NULL || username == NULL)
-					{
-						elog(FATAL, "Invalid initial packet, should be two netstrings.");
-						proc_exit(1);
-					}
-
-					BackgroundWorkerInitializeConnection(dbname, username);
-					elog(LOG, "RESTgres worker initialized, pid = %d, user = %s, db = %s", getpid(), dbname, username);
-
-				}
-				else
-				{
-					MemoryContext oldcontext = MemoryContextSwitchTo(request_context);
-					struct evkeyvalq headers = TAILQ_HEAD_INITIALIZER(headers);
-					struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(headers);
-					int status_code;
-
 					/* Internal error */
-					if(reply_fd == PGINVALID_SOCKET)
-					{
-						elog(FATAL, "Must receive reply fd before request");
-						pg_usleep(5000000);
-						proc_exit(1);
-					}
-
-					/* Pull out the headers, they are in their own little blob */
-					if(evbuffer_remove_netstring_buffer(request_buffer, headers_buffer) != 0)
-					{
-						elog(FATAL, "Invalid request payload from master: doesn't start with a netstring with all the headers");
-						proc_exit(1);
-					}
-
-					/* Remaining bytes after the header go into the body */
-					evbuffer_remove_buffer(request_buffer, body_buffer, evbuffer_get_length(request_buffer));
-
-					/* Parse headers */
-					evbuffer_parse_scgi_headers(headers_buffer, &headers);
-
-					/* Always return a Date header */
-					add_date_header(&reply_headers);
-
-					/* Now pass those pieces off to the handler */
-					status_code = backend_handle_request(&headers, body_buffer, &reply_headers, reply_body_buffer);
-
-					/* Drain the body buffer if the handler didn't already do that */
-					evbuffer_drain(body_buffer, evbuffer_get_length(body_buffer));
-
-					/* Collect the response line, headers, and body into a buffer to send */
-					evbuffer_add_http_response(status_code, &reply_headers, reply_body_buffer, reply_buffer);
-
-					/* Free headers */
-					evhttp_clear_headers(&reply_headers);
-					evhttp_clear_headers(&headers);
-
-					/* Write out the reply */
-					while(evbuffer_get_length(reply_buffer) > 0)
-					{
-						if(evbuffer_write(reply_buffer, reply_fd) < 0)
-						{
-							elog(WARNING, "Error writing reply to client: %s", strerror(errno));
-							evbuffer_drain(reply_buffer, evbuffer_get_length(reply_buffer));
-						}
-					}
-
-					/* Reset reply_fd so we get a new one */
-					reply_fd = PGINVALID_SOCKET;
-
-					MemoryContextSwitchTo(oldcontext);
-					MemoryContextReset(request_context);
+					elog(FATAL, "Must receive reply fd before request");
+					pg_usleep(5000000);
+					proc_exit(1);
 				}
+
+				/* Pull out the headers, they are in their own little blob */
+				if(evbuffer_remove_netstring_buffer(request_buffer, headers_buffer) != 0)
+				{
+					elog(FATAL, "Invalid request payload from master: doesn't start with a netstring with all the headers");
+					proc_exit(1);
+				}
+
+				/* Remaining bytes after the header go into the body */
+				evbuffer_remove_buffer(request_buffer, body_buffer, evbuffer_get_length(request_buffer));
+
+				/* Parse headers */
+				evbuffer_parse_scgi_headers(headers_buffer, &request_headers);
+
+				/* Always return a Date header */
+				add_date_header(&reply_headers);
+
+				/* Now pass those pieces off to the handler */
+				status_code = backend_handle_request(&request_headers, body_buffer, &reply_headers, reply_body_buffer);
+
+				/* Drain the body buffer if the handler didn't already do that */
+				evbuffer_drain(body_buffer, evbuffer_get_length(body_buffer));
+
+				/* Collect the response line, headers, and body into a buffer to send */
+				http_ver = evhttp_find_header(&request_headers, "HTTP");
+				evbuffer_add_http_response(status_code, http_ver, &reply_headers, reply_body_buffer, reply_buffer);
+
+				/* Free headers */
+				evhttp_clear_headers(&reply_headers);
+				evhttp_clear_headers(&request_headers);
+
+				/* Write out the reply */
+				while(evbuffer_get_length(reply_buffer) > 0)
+				{
+					if(evbuffer_write(reply_buffer, reply_fd) < 0)
+					{
+						elog(WARNING, "Error writing reply to client: %s", strerror(errno));
+						evbuffer_drain(reply_buffer, evbuffer_get_length(reply_buffer));
+					}
+				}
+
+				/* Reset reply_fd so we get a new one */
+				reply_fd = PGINVALID_SOCKET;
+
+				MemoryContextSwitchTo(oldcontext);
+				MemoryContextReset(request_context);
 			}
 		}
 	}

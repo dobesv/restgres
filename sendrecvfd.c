@@ -73,12 +73,16 @@ recvfd(int s)
 	msg.msg_control = (caddr_t)cms;
 	msg.msg_controllen = sizeof cms;
 
-	if((n=recvmsg(s, &msg, 0)) < 0)
+	if((n=recvmsg(s, &msg, MSG_DONTWAIT)) < 0)
 		return -1;
 	if(n == 0){
 		return -1;
 	}
+	if(msg.msg_controllen != sizeof cms)
+		return -1;
 	cmsg = CMSG_FIRSTHDR(&msg);
+	if(cmsg == NULL)
+		return -1;
 	memmove(&fd, CMSG_DATA(cmsg), sizeof(int));
 	return fd;
 }

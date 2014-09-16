@@ -86,6 +86,35 @@ evbuffer_add_headers(struct evbuffer *reply_buffer, struct evkeyvalq *headers);
 ssize_t
 evbuffer_remove_netstring_buffer(struct evbuffer *input, struct evbuffer *output);
 
+/**
+ * Wait until a whole netstring is available on fd, using input as the buffer,
+ * then move that netstring into output.
+ *
+ * This assumes the fd will block on read() when there's no input.
+ *
+ * Extra bytes read in the process will be left in the input buffer; also, any
+ * bytes already in the input buffer may be consumed to read the netstring.
+ *
+ * If read() returns -1, this will return -1, otherwise this returns 0.
+ */
+int
+read_netstring_buffer(pgsocket fd, struct evbuffer *input, struct evbuffer *output, int read_size);
+
+/**
+ * Wait until a whole netstring is available on fd, using input as the buffer,
+ * then move that netstring into a char buffer allocated using palloc() and
+ * return it.
+ *
+ * This assumes the fd will block on read()  when there's no input.
+ *
+ * Extra bytes read in the process will be left in the input buffer; also, any
+ * bytes already in the input buffer may be consumed to read the netstring.
+ *
+ * If read() returns -1, this will return NULL.
+ */
+char *
+read_netstring_cstring(pgsocket fd, struct evbuffer *input, int read_size);
+
 /*
  * Read a netstring from the input.  The input must contain a complete
  * netstring.  Returns a newly allocated cstring, which the caller must

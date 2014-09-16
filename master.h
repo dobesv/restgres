@@ -19,10 +19,11 @@ typedef enum
 struct restgres_backend
 {
 	RestgresBackendState state;
+	pid_t pid;
 	BackgroundWorkerHandle *bgworker_handle;
 	struct bufferevent *bev;
 	char *dbname;
-	char *user_name;
+	char *username;
 	int last_used;
 };
 

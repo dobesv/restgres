@@ -36,6 +36,7 @@
 #include <event2/util.h>
 #include <event2/keyvalq_struct.h>
 #include <event2/bufferevent.h>
+#include <event2/http_struct.h>
 
 #include <sys/queue.h>
 
@@ -153,7 +154,7 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
-								hostinfo, port->user_name,
+								hostinfo, port->username,
 								port->database_name,
 								port->ssl ? _("SSL on") : _("SSL off"))));
 #else
@@ -205,7 +206,7 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
-								hostinfo, port->user_name,
+								hostinfo, port->username,
 								port->database_name,
 								port->ssl ? _("SSL on") : _("SSL off")),
 						HOSTNAME_LOOKUP_DETAIL(port)));
@@ -344,7 +345,6 @@ static void listen_for_http_connections(struct evhttp *http)
 static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int socklen, void *cbarg)
 {
 	pid_t connected_pid=-1;
-	pid_t worker_pid;
 	uid_t uid;
 	gid_t gid;
 
@@ -362,13 +362,14 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 			/* Check PID if we can */
 			if(connected_pid != -1)
 			{
-				BgwHandleStatus status = GetBackgroundWorkerPid(backends[i].bgworker_handle, &worker_pid);
+				BgwHandleStatus status = GetBackgroundWorkerPid(backends[i].bgworker_handle, &backends[i].pid);
 				if(status != BGWH_STARTED)
 					continue;
-				if(connected_pid != worker_pid)
+				if(connected_pid != backends[i].pid)
 					continue;
 			}
 			bufferevent_setfd(backends[i].bev, fd);
+			backends[i].state = RestgresBackend_Idle;
 			return;
 		}
 	}
@@ -444,6 +445,15 @@ static void initialize_restgres(struct event_base *base)
 static void
 terminate_backend(struct restgres_backend* backend)
 {
+	if (backend->bgworker_handle)
+	{
+		pid_t worker_pid=0;
+		GetBackgroundWorkerPid(backend->bgworker_handle, &worker_pid);
+		elog(LOG, "Stopping unneeded backend pid %d, db = %s, user = %s", (int)worker_pid, backend->dbname, backend->username);
+		TerminateBackgroundWorker(backend->bgworker_handle);
+		pfree(backend->bgworker_handle);
+		backend->bgworker_handle = NULL;
+	}
 	if (backend->bev)
 	{
 		bufferevent_free(backend->bev);
@@ -456,18 +466,12 @@ terminate_backend(struct restgres_backend* backend)
 		backend->dbname = NULL;
 	}
 
-	if (backend->user_name)
+	if (backend->username)
 	{
-		free(backend->user_name);
-		backend->user_name = NULL;
+		free(backend->username);
+		backend->username = NULL;
 	}
 
-	if (backend->bgworker_handle)
-	{
-		TerminateBackgroundWorker(backend->bgworker_handle);
-		pfree(backend->bgworker_handle);
-		backend->bgworker_handle = NULL;
-	}
 }
 
 static struct restgres_backend *
@@ -478,24 +482,30 @@ init_backend(struct restgres_backend *backend, struct event_base *base, const ch
 	struct evbuffer *meta_temp;
 	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 
+	elog(LOG, "New restgres backend needed, db = %s, user = %s", dbname, user_name);
+
 	/* Recycle the backend if necessary */
 	terminate_backend(backend);
 
 	backend->state = RestgresBackend_Starting;
 	backend->bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS);
 	backend->dbname = pstrdup(dbname);
-	backend->user_name = pstrdup(user_name);
+	backend->username = pstrdup(user_name);
 
 	/* The first thing the backend will receive is the database and user_name */
 	output = bufferevent_get_output(backend->bev);
 	meta_temp = evbuffer_new();
-	evbuffer_add_netstring_cstring(meta_temp, dbname);
-	evbuffer_add_netstring_cstring(meta_temp, user_name);
-	evbuffer_add_netstring_buffer(output, meta_temp, true);
+	evbuffer_add_netstring_cstring(output, dbname);
+	evbuffer_add_netstring_cstring(output, user_name);
 	evbuffer_free(meta_temp);
 
 	worker.bgw_main = restgres_backend_main;
 	evutil_snprintf(worker.bgw_name, sizeof worker.bgw_name, "restgres %s %s", dbname, user_name);
+
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	backend->pid = -1;
 
 	/* Any memory allocation by RegisterDynamicBackgroundWorker, especially the bgworker handler, should survive this call */
 	RegisterDynamicBackgroundWorker(&worker, &backend->bgworker_handle);
@@ -517,7 +527,7 @@ static struct restgres_backend *get_backend(struct event_base *base, const char 
 			slot_to_reuse_last_used = 0;
 			break;
 		case RestgresBackend_Idle:
-			if(streql(backends[i].dbname, dbname) && streql(backends[i].user_name, user_name))
+			if(streql(backends[i].dbname, dbname) && streql(backends[i].username, user_name))
 			{
 				/* Just what we were looking for! */
 				return &backends[i];
@@ -562,7 +572,9 @@ static void send_to_backend(struct event_base *base, const char *dbname, const c
 	}
 	else
 	{
+		elog(LOG, "Sending reply fd %d to backend", reply_fd);
 		sendfd(bufferevent_getfd(backend->bev), reply_fd);
+		elog(LOG, "Sending %d byte request to backend", (int)evbuffer_get_length(buf));
 		evbuffer_add_netstring_buffer(bufferevent_get_output(backend->bev), buf, true);
 		backend->last_used = message_counter++;
 	}
@@ -586,6 +598,7 @@ static void handle_request(struct evhttp_request *req)
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
 	char lenbuf[16];
+	char httpbuf[6];
 	int reply_fd;
 
 	path = evhttp_request_get_uri(req);
@@ -627,6 +640,9 @@ static void handle_request(struct evhttp_request *req)
 	evbuffer_add_netstring_cstring(header_buf, lenbuf);
 	evbuffer_add_netstring_cstring(header_buf, "SCGI");
 	evbuffer_add_netstring_cstring(header_buf, "1");
+	evbuffer_add_netstring_cstring(header_buf, "HTTP");
+	sprintf(httpbuf, "%d.%d", req->major, req->minor);
+	evbuffer_add_netstring_cstring(header_buf, httpbuf);
 	evbuffer_add_netstring_cstring(header_buf, "REQUEST_METHOD");
 	evbuffer_add_netstring_cstring(header_buf, cmd_type_method(evhttp_request_get_command(req)));
 	evbuffer_add_netstring_cstring(header_buf, "REQUEST_URI");
@@ -706,6 +722,9 @@ void restgres_main(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	initialize_restgres(base);
+
+	/* Start up at least one backend, for testing */
+	get_backend(base, "postgres", "postgres");
 
 	elog(LOG, "RESTgres initialized, pid %d port %d listen_addresses \"%s\"",
 			getpid(), restgres_listen_port, restgres_listen_addresses);

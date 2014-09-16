@@ -331,7 +331,10 @@ evbuffer_netstring_available(struct evbuffer *input, ssize_t *offset_out, ssize_
 
 	length = *length_out = strtol(digits_buf, NULL, 10);
 
-	return (offset + length - evbuffer_get_length(input));
+	if(offset + length > evbuffer_get_length(input))
+		return (offset + length - evbuffer_get_length(input));
+
+	return 0;
 }
 
 /*
@@ -382,6 +385,35 @@ evbuffer_remove_netstring_cstring(struct evbuffer *input)
 	{
 		return NULL;
 	}
+}
+
+
+int
+read_netstring_buffer(pgsocket fd, struct evbuffer *input, struct evbuffer *output, int read_size)
+{
+	for(;;)
+	{
+		int rc;
+		int remaining = evbuffer_remove_netstring_buffer(input, output);
+		if(remaining == 0)
+			return 0;
+		rc = evbuffer_read(input, fd, remaining > 0 ? remaining : read_size);
+		if(rc < 0)
+			return rc;
+	}
+	return 0;
+}
+
+char *
+read_netstring_cstring(pgsocket fd, struct evbuffer *input, int read_size)
+{
+	char *result=NULL;
+	while(evbuffer_get_length(input) == 0 || (result = evbuffer_remove_netstring_cstring(input)) == NULL)
+	{
+		if(evbuffer_read(input, fd, read_size) < 0)
+			return NULL;
+	}
+	return result;
 }
 
 const char *cmd_type_strings[] = {
