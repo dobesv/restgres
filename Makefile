@@ -1,6 +1,6 @@
 
 MODULE_big = restgres
-OBJS = restgres.o
+OBJS = restgres.o util.o master.o backend.o bgwutil.o sendrecvfd.o response_phrase.o
 SHLIB_LINK += -levent
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
