@@ -310,7 +310,7 @@ static void listen_for_http_connections(struct evhttp *http)
 	rawstring = pstrdup(restgres_listen_addresses);
 
 	/* Parse string into path components */
-	if (!SplitIdentifierString(rawstring, '/', &elemlist))
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
 	{
 		/* syntax error in list */
 		ereport(FATAL,
