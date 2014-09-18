@@ -46,6 +46,7 @@
 #include "bgwutil.h"
 #include "sendrecvfd.h"
 #include "response_phrase.h"
+#include "routes.h"
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
@@ -158,9 +159,6 @@ static void
 evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer);
 static void
 evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers);
-static int
-backend_handle_request(struct evkeyvalq *headers, struct evbuffer *body_buffer, struct evkeyvalq *reply_headers, struct evbuffer *reply_buffer);
-
 
 
 /* Add a "Content-Length" header with value 'content_length' to headers,
@@ -191,14 +189,6 @@ evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyva
 	/* elog(LOG, "Reply: %.*s", (int)evbuffer_get_length(reply_buffer), evbuffer_pullup(reply_buffer, -1)); */
 }
 
-static int
-backend_handle_request(struct evkeyvalq *headers, struct evbuffer *body_buffer, struct evkeyvalq *reply_headers, struct evbuffer *reply_buffer)
-{
-	evhttp_add_header(reply_headers, "Content-Type", "application/json; charset=utf8");
-	evbuffer_add_cstring(reply_buffer, "{\"what\":\"TODO\"}\r\n");
-	return 200;
-}
-
 static void
 evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers)
 {
@@ -224,16 +214,31 @@ void restgres_backend_main(Datum main_arg)
 	pgsocket fd;
 	char *dbname = NULL;
 	char *username = NULL;
+	const char *http_ver = NULL;
+	pgsocket reply_fd = PGINVALID_SOCKET;
 	struct evbuffer *input = evbuffer_new();
 	struct evbuffer *request_buffer = evbuffer_new();
 	struct evbuffer *headers_buffer = evbuffer_new();
 	struct evbuffer *body_buffer = evbuffer_new();
 	struct evbuffer *reply_buffer = evbuffer_new();
 	struct evbuffer *reply_body_buffer = evbuffer_new();
-	const char *http_ver;
-
-	pgsocket reply_fd = PGINVALID_SOCKET;
-
+	struct evkeyvalq request_headers = TAILQ_HEAD_INITIALIZER(request_headers);
+	struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(reply_headers);
+	struct evkeyvalq query_params = TAILQ_HEAD_INITIALIZER(query_params);
+	struct evkeyvalq matchdict = TAILQ_HEAD_INITIALIZER(matchdict);
+	struct restgres_request req = {
+			0,
+			-1,
+			NULL,
+			0,
+			NULL,
+			&request_headers,
+			&query_params,
+			body_buffer,
+			&reply_headers,
+			reply_body_buffer,
+			&matchdict
+	};
 	MemoryContext request_context = AllocSetContextCreate(CurrentMemoryContext,
 			"request temporary context",
 			ALLOCSET_DEFAULT_MINSIZE,
@@ -301,15 +306,13 @@ void restgres_backend_main(Datum main_arg)
 		{
 			if(reply_fd == PGINVALID_SOCKET)
 			{
-				reply_fd = recvfd(fd);
+				reply_fd = req.reply_fd = recvfd(fd);
 			}
 
 			if(read_netstring_buffer(fd, input, request_buffer, 65536) == 0)
 			{
 				MemoryContext oldcontext = MemoryContextSwitchTo(request_context);
-				struct evkeyvalq request_headers = TAILQ_HEAD_INITIALIZER(request_headers);
-				struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(reply_headers);
-				int status_code;
+				struct restgres_route *best_route;
 
 				/* Notify master we are busy with that request */
 				if(write(fd, "B", 1) < 0)
@@ -338,16 +341,49 @@ void restgres_backend_main(Datum main_arg)
 				/* Parse headers */
 				evbuffer_parse_scgi_headers(headers_buffer, &request_headers);
 
-				http_ver = evhttp_find_header(&request_headers, "http");
+				req.http_ver = http_ver = evhttp_find_header(&request_headers, "http");
+				req.cmd_type = method_cmd_type(evhttp_find_header(&request_headers, "request_method"));
 
 				/* Always return a Date header */
 				add_date_header(&reply_headers);
 
+				/* Pre-parse the URI and query parameters, for convenience */
+				req.uri = evhttp_uri_parse(evhttp_find_header(req.headers, "request_uri"));
+				evhttp_parse_query_str(evhttp_uri_get_query(req.uri), &query_params);
+
+				/* Default status is 404, meaning we never matched any route */
+				req.status_code = 404;
+
 				/* Now pass those pieces off to the handler */
-				status_code = backend_handle_request(&request_headers, body_buffer, &reply_headers, reply_body_buffer);
+				best_route = find_best_route(&req);
+				if(best_route != NULL)
+				{
+					elog(LOG, "Request matches route %s", best_route->name);
+
+					/* Default to status 200 if they don't set an error */
+					req.status_code = 200;
+
+					/* Fill in the matchdict */
+					parse_route_uri_pattern(evhttp_uri_get_path(req.uri), best_route->pattern, &matchdict);
+
+					/* Invoke the handler */
+					best_route->handler(&req);
+				}
+				else
+				{
+					/* Not found */
+					req.status_code = 404;
+				}
+
+				/* Don't send any body if the request is a HEAD request */
+				if(req.cmd_type == EVHTTP_REQ_HEAD)
+				{
+					elog(LOG, "Header is a HEAD request, discarding body of response (if any)");
+					evbuffer_drain(reply_body_buffer, evbuffer_get_length(reply_body_buffer));
+				}
 
 				/* Collect the response line, headers, and body into a buffer to send */
-				evbuffer_add_http_response(status_code, http_ver, &reply_headers, reply_body_buffer, reply_buffer);
+				evbuffer_add_http_response(req.status_code, http_ver, &reply_headers, reply_body_buffer, reply_buffer);
 
 				/* Drain the body buffer if the handler didn't already do that */
 				evbuffer_drain(body_buffer, evbuffer_get_length(body_buffer));
@@ -355,6 +391,13 @@ void restgres_backend_main(Datum main_arg)
 				/* Free headers */
 				evhttp_clear_headers(&reply_headers);
 				evhttp_clear_headers(&request_headers);
+				evhttp_clear_headers(&query_params);
+				evhttp_clear_headers(&matchdict);
+				if(req.uri)
+				{
+					evhttp_uri_free(req.uri);
+					req.uri = NULL;
+				}
 
 				/* Write out the reply */
 				while(evbuffer_get_length(reply_buffer) > 0)
@@ -371,7 +414,7 @@ void restgres_backend_main(Datum main_arg)
 				close(reply_fd);
 
 				/* Reset reply_fd so we get a new one */
-				reply_fd = PGINVALID_SOCKET;
+				reply_fd = req.reply_fd = PGINVALID_SOCKET;
 
 				MemoryContextSwitchTo(oldcontext);
 				MemoryContextReset(request_context);

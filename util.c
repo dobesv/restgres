@@ -110,7 +110,7 @@ const char *
 _escape_quotes(const char *input, char q)
 {
 	int len = 1;
-	int quotes = 0;
+	int escapes = 0;
 	char *output;
 	const char *a;
 	char *b;
@@ -119,16 +119,18 @@ _escape_quotes(const char *input, char q)
 		return NULL;
 	for (const char *p = input; *p; p++)
 	{
-		if (*p == q)
+		if (*p == q || *p == '\\')
+		{
 			len++;
+			escapes++;
+		}
 		len++;
-		quotes++;
 	}
 
-	if (quotes == 0)
+	if (escapes == 0)
 		return input;
 
-	b = output = palloc(len);
+	b = output = palloc(len+1);
 	for (a = input; *a; a++)
 	{
 		if (*a == q || *a == '\\')
@@ -143,80 +145,6 @@ _escape_quotes(const char *input, char q)
 	return output;
 }
 
-/*
- * Produce a JSON string literal, properly escaping characters in the text.
- */
-void
-escape_json(StringInfo buf, const char *str)
-{
-	const char *p;
-
-	appendStringInfoCharMacro(buf, '\"');
-	for (p = str; *p; p++)
-	{
-		switch (*p)
-		{
-		case '\b':
-			appendStringInfoString(buf, "\\b");
-			break;
-		case '\f':
-			appendStringInfoString(buf, "\\f");
-			break;
-		case '\n':
-			appendStringInfoString(buf, "\\n");
-			break;
-		case '\r':
-			appendStringInfoString(buf, "\\r");
-			break;
-		case '\t':
-			appendStringInfoString(buf, "\\t");
-			break;
-		case '"':
-			appendStringInfoString(buf, "\\\"");
-			break;
-		case '\\':
-
-			/*
-			 * Unicode escapes are passed through as is. There is no
-			 * requirement that they denote a valid character in the
-			 * server encoding - indeed that is a big part of their
-			 * usefulness.
-			 *
-			 * All we require is that they consist of \uXXXX where the Xs
-			 * are hexadecimal digits. It is the responsibility of the
-			 * caller of, say, to_json() to make sure that the unicode
-			 * escape is valid.
-			 *
-			 * In the case of a jsonb string value being escaped, the only
-			 * unicode escape that should be present is \u0000, all the
-			 * other unicode escapes will have been resolved.
-			 */
-			if (p[1] == 'u'&&
-			isxdigit((unsigned char) p[2]) &&
-			isxdigit((unsigned char) p[3]) &&
-			isxdigit((unsigned char) p[4]) &&
-			isxdigit((unsigned char) p[5]))
-				appendStringInfoCharMacro(buf, *p);
-			else
-				appendStringInfoString(buf, "\\\\");
-			break;
-		default:
-			if ((unsigned char) *p < ' ')
-				appendStringInfo(buf, "\\u%04x", (int) *p);
-			else
-				appendStringInfoCharMacro(buf, *p);
-			break;
-		}
-	}
-	appendStringInfoCharMacro(buf, '\"');
-}
-
-//static
-//const char *_escape_single_quotes(const char *input)
-//{
-//	return _escape_quotes(input, '\'');
-//}
-
 const char *
 _escape_double_quotes(const char *input)
 {
@@ -230,6 +158,15 @@ void
 evbuffer_add_cstring(struct evbuffer *buf, const char *str)
 {
 	evbuffer_add(buf, str, strlen(str));
+}
+
+/**
+ * Add a single character to the buffer.
+ */
+void
+evbuffer_add_char(struct evbuffer *buf, char ch)
+{
+	evbuffer_add(buf, &ch, 1);
 }
 
 /* Add CRLF to a buffer */
@@ -439,6 +376,56 @@ read_netstring_cstring(pgsocket fd, struct evbuffer *input, int read_size)
 	return result;
 }
 
+void
+evbuffer_add_json_cstring(struct evbuffer *buf, const char *str)
+{
+	int len = 1;
+	const char *p;
+
+	if (str == NULL)
+		return;
+	for (const char *p = str; *p; p++)
+	{
+		if (*p < ' ' || strchr("\"\b\f\n\r\t\\", *p) != NULL)
+			len++;
+		len++;
+	}
+
+
+	/* Reserve space for the new escaped string */
+	evbuffer_expand(buf, evbuffer_get_length(buf) + len + 2);
+
+	evbuffer_add_char(buf, '"');
+	for (p = str; *p; p++)
+	{
+		switch (*p)
+		{
+		case '\b': evbuffer_add_cstring(buf, "\\b"); break;
+		case '\f': evbuffer_add_cstring(buf, "\\f"); break;
+		case '\n': evbuffer_add_cstring(buf, "\\n"); break;
+		case '\r': evbuffer_add_cstring(buf, "\\r"); break;
+		case '\t': evbuffer_add_cstring(buf, "\\t"); break;
+		case '"': evbuffer_add_cstring(buf, "\\\""); break;
+		case '\\': evbuffer_add_cstring(buf, "\\\\"); break;
+		default:
+			if ((unsigned char) *p < ' ')
+				evbuffer_add_printf(buf, "\\u%04x", (int) *p);
+			else
+				evbuffer_add_char(buf, *p);
+			break;
+		}
+	}
+	evbuffer_add_char(buf, '\"');
+}
+
+void
+evbuffer_add_json_cstring_pair(struct evbuffer *buf, const char *key, const char *value)
+{
+	evbuffer_add_json_cstring(buf, key);
+	evbuffer_add_cstring(buf, ":");
+	evbuffer_add_json_cstring(buf, value);
+}
+
 const char *cmd_type_strings[] = {
 		"GET",
 		"POST",
@@ -461,7 +448,7 @@ cmd_type_method(enum evhttp_cmd_type cmd_type)
 }
 
 enum evhttp_cmd_type
-method_cmd_type(char *method)
+method_cmd_type(const char *method)
 {
 	for(int i=0; i < num_cmd_type_strings; i++)
 	{
@@ -586,3 +573,10 @@ getpeerpideid(int sock, pid_t *pid, uid_t *uid, gid_t *gid)
 	return -1;
 #endif
 }
+
+void
+add_json_content_type_header(struct evkeyvalq *headers)
+{
+	evhttp_add_header(headers, "Content-Type", "application/json; charset=utf-8");
+}
+

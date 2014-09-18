@@ -44,6 +44,9 @@
 #include "master.h"
 #include "bgwutil.h"
 
+struct evutil_addrinfo *
+get_domain_socket_addr();
+
 /*
  * Signal handler for SIGTERM
  *		Set a flag to let the main loop to terminate, and set our latch to wake

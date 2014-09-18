@@ -13,22 +13,27 @@
 #include <event2/buffer.h>
 
 const char *
-cmd_type_method(enum evhttp_cmd_type cmd_type);
-
-
-const char *
 remove_prefix(const char *name, const char *path);
-
-void
-escape_json(StringInfo buf, const char *str);
 
 /* Add a cstring to a buffer */
 void
 evbuffer_add_cstring(struct evbuffer *buf, const char *str);
 
+/* Add a single character to a buffer */
+void
+evbuffer_add_char(struct evbuffer *buf, char ch);
+
 /* Add CRLF to a buffer */
 void
 evbuffer_add_crlf(struct evbuffer *buf);
+
+/* Quote and escape the given cstring and append it to the buffer */
+void
+evbuffer_add_json_cstring(struct evbuffer *buf, const char *str);
+
+/* Quote and escape the given cstring key/value pair and append them to the buffer separated by ':' */
+void
+evbuffer_add_json_cstring_pair(struct evbuffer *buf, const char *key, const char *value);
 
 /*
  * Escape quotes in the string, if there are any.  If not, returns the original string.  Any
@@ -46,7 +51,7 @@ _escape_double_quotes(const char *input);
  * Get a evhttp_cmd_type for a char *
  */
 enum evhttp_cmd_type
-method_cmd_type(char *method);
+method_cmd_type(const char *method);
 
 /**
  * Get a char * for a evhttp_cmd_type.
@@ -177,5 +182,8 @@ streql(const char *a, const char *b);
 int
 getpeerpideid(int sock, pid_t *pid, uid_t *uid, gid_t *gid);
 
+/* Add Content-Type: application/json;charset=utf8 to headers */
+void
+add_json_content_type_header(struct evkeyvalq *headers);
 
 #endif /* RESTGRES_EVUTIL_H_ */

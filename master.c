@@ -627,7 +627,6 @@ static void
 backend_idle(struct event_base *base, struct restgres_backend *backend)
 {
 	struct restgres_queued_request *x=NULL;
-	bool matched = true;
 
 	/* Nothing to do if nothing is queued */
 	if(SIMPLEQ_EMPTY(&queued_requests))
@@ -684,7 +683,7 @@ send_to_backend(struct event_base *base, const char *dbname, const char *user_na
  * Convert the request into an SCGI request and send that to a backend for processing.
  */
 static void
-handle_request(struct evhttp_request *req)
+dispatch_request(struct evhttp_request *req)
 {
 	struct evhttp_connection* conn = evhttp_request_get_connection(req);
 	struct event_base* base = evhttp_connection_get_base(conn);
@@ -791,7 +790,7 @@ static void restgres_http_cb(struct evhttp_request *req, void *arg)
 			(void) fwrite(cbuf, 1, n, stdout);
 	}
 
-	handle_request(req);
+	dispatch_request(req);
 
 	SPI_finish();
 	PopActiveSnapshot();
