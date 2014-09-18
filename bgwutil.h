@@ -8,8 +8,10 @@
 #ifndef BGWUTIL_H_
 #define BGWUTIL_H_
 
-void watch_for_signals_and_postmaster_death(struct event_base *base);
+void
+watch_for_signals_and_postmaster_death(struct event_base *base);
 
-struct evutil_addrinfo *get_domain_socket_addr();
+struct evutil_addrinfo *
+get_domain_socket_addr();
 
 #endif /* BGWUTIL_H_ */

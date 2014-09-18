@@ -258,6 +258,29 @@ evbuffer_add_netstring_cstring(struct evbuffer *buf, const char *string)
 	}
 }
 
+int
+evbuffer_add_netstring_vprintf(struct evbuffer *buf, const char *fmt, va_list ap)
+{
+	struct evbuffer *temp = evbuffer_new();
+	int rc = evbuffer_add_vprintf(temp, fmt, ap);
+	evbuffer_add_netstring_buffer(buf, temp, true);
+	evbuffer_free(temp);
+	return rc;
+}
+
+int
+evbuffer_add_netstring_printf(struct evbuffer *buf, const char *fmt, ...)
+{
+	int res = -1;
+	va_list ap;
+
+	va_start(ap, fmt);
+	res = evbuffer_add_netstring_vprintf(buf, fmt, ap);
+	va_end(ap);
+
+	return (res);
+}
+
 void
 evbuffer_add_netstring_buffer(struct evbuffer *buf, struct evbuffer *string, bool drain_src)
 {
@@ -275,7 +298,7 @@ evbuffer_add_headers(struct evbuffer *reply_buffer, struct evkeyvalq *headers)
 	TAILQ_FOREACH(header, headers, next)
 	{
 		evbuffer_add_cstring(reply_buffer, header->key);
-		evbuffer_add_cstring(reply_buffer, ": ");
+		evbuffer_add(reply_buffer, ": ", 2);
 		evbuffer_add_cstring(reply_buffer, header->value);
 		evbuffer_add_crlf(reply_buffer);
 	}

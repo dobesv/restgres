@@ -71,6 +71,14 @@ static void
 terminate_backend(struct restgres_backend* backend);
 static void
 worker_listener_error_cb(struct evconnlistener *lev, void *arg);
+static void
+write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, int reply_fd);
+static struct restgres_backend *
+get_backend(struct event_base *base, const char *dbname, const char *user_name);
+static void
+send_to_backend(struct event_base *base, const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd);
+static void
+backend_idle(struct event_base *base, struct restgres_backend *backend);
 
 struct restgres_backend *backends = NULL;
 
@@ -342,6 +350,46 @@ static void listen_for_http_connections(struct evhttp *http)
 
 }
 
+static void
+worker_data_cb(struct bufferevent *bev, void *ctx)
+{
+	struct restgres_backend *backend = ctx;
+	struct evbuffer *input = bufferevent_get_input(bev);
+	if(evbuffer_get_length(input) > 1)
+	{
+		evbuffer_drain(input, evbuffer_get_length(input)-1);
+	}
+
+	if(evbuffer_get_length(input) == 1)
+	{
+		char ch = 0;
+		evbuffer_remove(input, &ch, 1);
+		switch(ch)
+		{
+		case 0: break;
+		case 'I':
+			/* Worker will notify us when it is idle */
+			backend->state = RestgresBackend_Idle;
+
+			backend_idle(bufferevent_get_base(bev), backend);
+
+			break;
+		case 'B':
+			/* Worker will notify us when it is idle */
+			backend->state = RestgresBackend_Busy;
+			break;
+		}
+	}
+}
+
+static void
+worker_event_cb(struct bufferevent *bev, short what, void *ctx)
+{
+	struct restgres_backend *backend = ctx;
+	/* The only events we'd get here would be errors */
+	terminate_backend(backend);
+}
+
 static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int socklen, void *cbarg)
 {
 	pid_t connected_pid=-1;
@@ -369,6 +417,7 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 					continue;
 			}
 			bufferevent_setfd(backends[i].bev, fd);
+			bufferevent_setcb(backends[i].bev, worker_data_cb, NULL, worker_event_cb, &backends[i]);
 			backends[i].state = RestgresBackend_Idle;
 			return;
 		}
@@ -471,7 +520,7 @@ terminate_backend(struct restgres_backend* backend)
 		free(backend->username);
 		backend->username = NULL;
 	}
-
+	backend->state = RestgresBackend_Unused;
 }
 
 static struct restgres_backend *
@@ -513,7 +562,8 @@ init_backend(struct restgres_backend *backend, struct event_base *base, const ch
 	return backend;
 }
 
-static struct restgres_backend *get_backend(struct event_base *base, const char *dbname, const char *user_name)
+static struct restgres_backend *
+get_backend(struct event_base *base, const char *dbname, const char *user_name)
 {
 	int slot_to_reuse = -1;
 	int slot_to_reuse_last_used = INT_MAX;
@@ -552,38 +602,89 @@ static struct restgres_backend *get_backend(struct event_base *base, const char 
 	return init_backend(&backends[slot_to_reuse], base, dbname, user_name);
 }
 
-void enqueue_request(const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd) {
+static void
+enqueue_request(const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd) {
 	struct restgres_queued_request *x = malloc(sizeof (struct restgres_queued_request));
 	x->dbname = strdup(dbname);
-	x->user_name = strdup(user_name);
+	x->username = strdup(user_name);
 	x->request = evbuffer_new();
 	evbuffer_remove_buffer(buf, x->request, evbuffer_get_length(buf));
 	x->reply_fd = reply_fd;
 	SIMPLEQ_INSERT_TAIL(&queued_requests, x, next);
 }
 
-static void send_to_backend(struct event_base *base, const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd)
+static void
+dequeue_request(struct restgres_queued_request *x)
+{
+	SIMPLEQ_REMOVE(&queued_requests, x, restgres_queued_request, next);
+	free(x->dbname);
+	free(x->username);
+	evbuffer_free(x->request);
+	x->reply_fd = -1;
+	free(x);
+}
+static void
+backend_idle(struct event_base *base, struct restgres_backend *backend)
+{
+	struct restgres_queued_request *x=NULL;
+	bool matched = true;
+
+	/* Nothing to do if nothing is queued */
+	if(SIMPLEQ_EMPTY(&queued_requests))
+		return;
+
+	SIMPLEQ_FOREACH(x, &queued_requests, next)
+	{
+		if(streql(backend->dbname, x->dbname) && streql(backend->username, x->username))
+		{
+			write_to_backend(backend, x->request, x->reply_fd);
+			dequeue_request(x);
+			return;
+		}
+	}
+
+	/*
+	 * If we get here we didn't find a request directed at this backend.
+	 * we should kill the idle backend and launch a new one for the new parameters.
+	 *
+	 * send_to_backend should do this for us.
+	 */
+	x = SIMPLEQ_FIRST(&queued_requests);
+	send_to_backend(base, x->dbname, x->username, x->request, x->reply_fd);
+	dequeue_request(x);
+}
+
+static void
+write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, int reply_fd)
+{
+	sendfd(bufferevent_getfd(backend->bev), reply_fd);
+	evbuffer_add_netstring_buffer(bufferevent_get_output(backend->bev), buf, true);
+	backend->last_used = message_counter++;
+	close(reply_fd); /* Close the fd, the backend should take it over and close it when it is done */
+
+}
+static void
+send_to_backend(struct event_base *base, const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd)
 {
 	/* Get or launch a backend */
 	struct restgres_backend *backend = get_backend(base, dbname, user_name);
 	if(backend == NULL)
 	{
+		/* We'll get here if all the backends are already allocated to other username/db combinations */
+		/* TODO currently we enqueue these ... and never actually send them to the backend! */
 		enqueue_request(dbname, user_name, buf, reply_fd);
 	}
 	else
 	{
-		elog(LOG, "Sending reply fd %d to backend", reply_fd);
-		sendfd(bufferevent_getfd(backend->bev), reply_fd);
-		elog(LOG, "Sending %d byte request to backend", (int)evbuffer_get_length(buf));
-		evbuffer_add_netstring_buffer(bufferevent_get_output(backend->bev), buf, true);
-		backend->last_used = message_counter++;
+		write_to_backend(backend, buf, reply_fd);
 	}
 }
 
 /**
  * Convert the request into an SCGI request and send that to a backend for processing.
  */
-static void handle_request(struct evhttp_request *req)
+static void
+handle_request(struct evhttp_request *req)
 {
 	struct evhttp_connection* conn = evhttp_request_get_connection(req);
 	struct event_base* base = evhttp_connection_get_base(conn);
@@ -597,8 +698,6 @@ static void handle_request(struct evhttp_request *req)
 	struct evbuffer *buf;
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
-	char lenbuf[16];
-	char httpbuf[6];
 	int reply_fd;
 
 	path = evhttp_request_get_uri(req);
@@ -635,14 +734,12 @@ static void handle_request(struct evhttp_request *req)
 	reply_fd = bufferevent_getfd(evhttp_connection_get_bufferevent(evhttp_request_get_connection(req)));
 
 	// SCGI formatted request
-	sprintf(lenbuf, "%d", (int)evbuffer_get_length(input));
 	evbuffer_add_netstring_cstring(header_buf, "CONTENT_LENGTH");
-	evbuffer_add_netstring_cstring(header_buf, lenbuf);
+	evbuffer_add_netstring_printf(header_buf, "%d", (int)evbuffer_get_length(input));
 	evbuffer_add_netstring_cstring(header_buf, "SCGI");
 	evbuffer_add_netstring_cstring(header_buf, "1");
 	evbuffer_add_netstring_cstring(header_buf, "HTTP");
-	sprintf(httpbuf, "%d.%d", req->major, req->minor);
-	evbuffer_add_netstring_cstring(header_buf, httpbuf);
+	evbuffer_add_netstring_printf(header_buf, "%d.%d", req->major, req->minor);
 	evbuffer_add_netstring_cstring(header_buf, "REQUEST_METHOD");
 	evbuffer_add_netstring_cstring(header_buf, cmd_type_method(evhttp_request_get_command(req)));
 	evbuffer_add_netstring_cstring(header_buf, "REQUEST_URI");
@@ -726,7 +823,7 @@ void restgres_main(Datum main_arg)
 	/* Start up at least one backend, for testing */
 	get_backend(base, "postgres", "postgres");
 
-	elog(LOG, "RESTgres initialized, pid %d port %d listen_addresses \"%s\"",
+	elog(LOG, "restgres initialized, pid %d port %d listen_addresses \"%s\"",
 			getpid(), restgres_listen_port, restgres_listen_addresses);
 
 	event_base_dispatch(base);

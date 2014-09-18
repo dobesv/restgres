@@ -178,23 +178,24 @@ evhttp_maybe_add_content_length_header(struct evkeyvalq *headers, size_t content
 }
 
 static void
-evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyvalq *headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer)
+evbuffer_add_http_response(int status_code, const char *http_ver, struct evkeyvalq *reply_headers, struct evbuffer *reply_body, struct evbuffer *reply_buffer)
 {
 	/* Make sure we have Date and Content-Length */
-	evhttp_maybe_add_content_length_header(headers, evbuffer_get_length(reply_body));
+	evhttp_maybe_add_content_length_header(reply_headers, evbuffer_get_length(reply_body));
 
 	/* TODO figure out the right HTTP version to return */
 	evbuffer_add_printf(reply_buffer, "HTTP/%s %d %s\r\n", http_ver, status_code, http_response_phrase(status_code));
-	evbuffer_add_headers(reply_buffer, headers);
+	evbuffer_add_headers(reply_buffer, reply_headers);
 	evbuffer_add_crlf(reply_buffer);
 	evbuffer_remove_buffer(reply_body, reply_buffer, evbuffer_get_length(reply_body));
+	/* elog(LOG, "Reply: %.*s", (int)evbuffer_get_length(reply_buffer), evbuffer_pullup(reply_buffer, -1)); */
 }
 
 static int
 backend_handle_request(struct evkeyvalq *headers, struct evbuffer *body_buffer, struct evkeyvalq *reply_headers, struct evbuffer *reply_buffer)
 {
-	evhttp_add_header(headers, "Content-Type", "application/json");
-	evbuffer_add_cstring(reply_buffer, "{\"what\":\"TODO\"}");
+	evhttp_add_header(reply_headers, "Content-Type", "application/json; charset=utf8");
+	evbuffer_add_cstring(reply_buffer, "{\"what\":\"TODO\"}\r\n");
 	return 200;
 }
 
@@ -202,13 +203,14 @@ static void
 evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers)
 {
 	char *key;
+	/* elog(LOG, "Headers: %.*s", (int)evbuffer_get_length(input), (char *)evbuffer_pullup(input, -1)); */
 	while((key = evbuffer_remove_netstring_cstring(input)) != NULL)
 	{
 		char *value = evbuffer_remove_netstring_cstring(input);
 		if(value == NULL)
 			break;
 		evhttp_add_header(headers, key, value);
-		elog(LOG, "Got header; %s: %s", key, value);
+		/* elog(LOG, "Got header; %s: %s", key, value); */
 	}
 	if(evbuffer_get_length(input) != 0)
 	{
@@ -271,10 +273,6 @@ void restgres_backend_main(Datum main_arg)
 	{
 		int			rc;
 
-//		elog(LOG, "Sleep before WaitLatchOrSocket ...");
-//		pg_usleep(30000000);
-		elog(LOG, "About to WaitLatchOrSocket ...");
-
 		/*
 		 * Background workers mustn't call usleep() or any direct equivalent:
 		 * instead, they may wait on their process latch, which sleeps as
@@ -285,8 +283,6 @@ void restgres_backend_main(Datum main_arg)
 					   WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE,
 					   fd,
 					   0);
-		elog(LOG, "WaitLatchOrSocket returns %x", rc);
-
 		ResetLatch(&MyProc->procLatch);
 
 		/* emergency bailout if postmaster has died */
@@ -303,29 +299,29 @@ void restgres_backend_main(Datum main_arg)
 
 		if (rc & WL_SOCKET_READABLE)
 		{
-			elog(LOG, "Got something on our socket...");
-
 			if(reply_fd == PGINVALID_SOCKET)
 			{
-				elog(LOG, "Trying to read reply fd ...");
 				reply_fd = recvfd(fd);
-				elog(LOG, "Reply fd is %d", reply_fd);
 			}
 
 			if(read_netstring_buffer(fd, input, request_buffer, 65536) == 0)
 			{
 				MemoryContext oldcontext = MemoryContextSwitchTo(request_context);
 				struct evkeyvalq request_headers = TAILQ_HEAD_INITIALIZER(request_headers);
-				struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(request_headers);
+				struct evkeyvalq reply_headers = TAILQ_HEAD_INITIALIZER(reply_headers);
 				int status_code;
 
-				elog(LOG, "Trying to read scgi request in %d bytes", (int)evbuffer_get_length(request_buffer));
+				/* Notify master we are busy with that request */
+				if(write(fd, "B", 1) < 0)
+				{
+					elog(FATAL, "Error sending status 'B' to master.");
+					proc_exit(1);
+				}
 
 				if(reply_fd == PGINVALID_SOCKET)
 				{
 					/* Internal error */
 					elog(FATAL, "Must receive reply fd before request");
-					pg_usleep(5000000);
 					proc_exit(1);
 				}
 
@@ -342,18 +338,19 @@ void restgres_backend_main(Datum main_arg)
 				/* Parse headers */
 				evbuffer_parse_scgi_headers(headers_buffer, &request_headers);
 
+				http_ver = evhttp_find_header(&request_headers, "http");
+
 				/* Always return a Date header */
 				add_date_header(&reply_headers);
 
 				/* Now pass those pieces off to the handler */
 				status_code = backend_handle_request(&request_headers, body_buffer, &reply_headers, reply_body_buffer);
 
+				/* Collect the response line, headers, and body into a buffer to send */
+				evbuffer_add_http_response(status_code, http_ver, &reply_headers, reply_body_buffer, reply_buffer);
+
 				/* Drain the body buffer if the handler didn't already do that */
 				evbuffer_drain(body_buffer, evbuffer_get_length(body_buffer));
-
-				/* Collect the response line, headers, and body into a buffer to send */
-				http_ver = evhttp_find_header(&request_headers, "HTTP");
-				evbuffer_add_http_response(status_code, http_ver, &reply_headers, reply_body_buffer, reply_buffer);
 
 				/* Free headers */
 				evhttp_clear_headers(&reply_headers);
@@ -366,14 +363,26 @@ void restgres_backend_main(Datum main_arg)
 					{
 						elog(WARNING, "Error writing reply to client: %s", strerror(errno));
 						evbuffer_drain(reply_buffer, evbuffer_get_length(reply_buffer));
+						break;
 					}
 				}
+
+				/* Close reply_fd - no keep-alive support for now */
+				close(reply_fd);
 
 				/* Reset reply_fd so we get a new one */
 				reply_fd = PGINVALID_SOCKET;
 
 				MemoryContextSwitchTo(oldcontext);
 				MemoryContextReset(request_context);
+
+				/* Notify master we are done with that request */
+				if(write(fd, "I", 1) < 0)
+				{
+					elog(FATAL, "Error sending status 'I' to master.");
+					proc_exit(1);
+				}
+
 			}
 		}
 	}

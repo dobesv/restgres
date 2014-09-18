@@ -69,6 +69,23 @@ evbuffer_add_netstring_buffer(struct evbuffer *buf, struct evbuffer *string, boo
 void
 evbuffer_add_netstring_cstring(struct evbuffer *buf, const char *string);
 
+/* Add a formatted string as a netstring */
+int
+evbuffer_add_netstring_vprintf(struct evbuffer *buf, const char *fmt, va_list ap)
+#ifdef __GNUC__
+	__attribute__((format(printf, 2, 0)))
+#endif
+;
+
+/* Add a formatted string as a netstring */
+int
+evbuffer_add_netstring_printf(struct evbuffer *buf, const char *fmt, ...)
+#ifdef __GNUC__
+	__attribute__((format(printf, 2, 0)))
+#endif
+;
+
+
 /* Add headers to the given output buffer, separated using CRLF */
 void
 evbuffer_add_headers(struct evbuffer *reply_buffer, struct evkeyvalq *headers);

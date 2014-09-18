@@ -31,7 +31,7 @@ struct restgres_queued_request
 {
 	SIMPLEQ_ENTRY(restgres_queued_request) next;
 	char *dbname;
-	char *user_name;
+	char *username;
 	struct evbuffer *request;
 	int reply_fd;
 };

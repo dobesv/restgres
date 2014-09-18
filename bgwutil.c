@@ -49,7 +49,8 @@
  *		Set a flag to let the main loop to terminate, and set our latch to wake
  *		it up.
  */
-static void restgres_sigterm(evutil_socket_t s, short what, void *arg)
+static void
+restgres_sigterm(evutil_socket_t s, short what, void *arg)
 {
 	event_base_loopbreak((struct event_base *) arg);
 }
@@ -59,7 +60,8 @@ static void restgres_sigterm(evutil_socket_t s, short what, void *arg)
  *		Set a flag to tell the main loop to reread the config file, and set
  *		our latch to wake it up.
  */
-static void restgres_sighup(evutil_socket_t s, short what, void *arg)
+static void
+restgres_sighup(evutil_socket_t s, short what, void *arg)
 {
 	ProcessConfigFile(PGC_SIGHUP);
 }
@@ -67,12 +69,14 @@ static void restgres_sighup(evutil_socket_t s, short what, void *arg)
 /*
  * Handler for a death notification from the postmaster
  */
-static void postmaster_death_cb(evutil_socket_t s, short what, void *arg)
+static void
+postmaster_death_cb(evutil_socket_t s, short what, void *arg)
 {
 	event_base_loopbreak((struct event_base *) arg);
 }
 
-void watch_for_signals_and_postmaster_death(struct event_base *base)
+void
+watch_for_signals_and_postmaster_death(struct event_base *base)
 {
 	/* Watch for SIGHUP and SIGTERM */
 	evsignal_new(base, SIGHUP, (event_callback_fn )restgres_sighup, base);
@@ -84,7 +88,8 @@ void watch_for_signals_and_postmaster_death(struct event_base *base)
 
 }
 
-struct evutil_addrinfo *get_domain_socket_addr()
+struct evutil_addrinfo *
+get_domain_socket_addr()
 {
 	static struct sockaddr_un address = {0};
 	static struct evutil_addrinfo addrinfo = {0};
