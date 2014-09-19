@@ -103,7 +103,8 @@ evbuffer_add_headers(struct evbuffer *reply_buffer, struct evkeyvalq *headers);
  * of additional bytes needed if the length of the netstring was available,
  * or -1 if the length of the netstring was not availabe.
  *
- * If the netstring is fully available, this copies it into the provided buffer.
+ * If the netstring is fully available, this copies it into the provided buffer
+ * and returns 0.
  */
 ssize_t
 evbuffer_remove_netstring_buffer(struct evbuffer *input, struct evbuffer *output);
@@ -145,6 +146,10 @@ read_netstring_cstring(pgsocket fd, struct evbuffer *input, int read_size);
  */
 char *
 evbuffer_remove_netstring_cstring(struct evbuffer *input);
+
+/* Parse pairs of netstrings into an evhttp headers data structure */
+int
+evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers);
 
 /*
  * Create a socket and optionally set some flags on it

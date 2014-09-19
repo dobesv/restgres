@@ -6,12 +6,6 @@
 
 /* These are always necessary for a bgworker */
 #include "miscadmin.h"
-#include "postmaster/bgworker.h"
-#include "storage/ipc.h"
-#include "storage/latch.h"
-#include "storage/lwlock.h"
-#include "storage/proc.h"
-#include "storage/shmem.h"
 
 /* these headers are used by this particular worker's code */
 #include "access/xact.h"
@@ -24,37 +18,54 @@
 #include "utils/memutils.h"
 #include "tcop/utility.h"
 #include "libpq/libpq.h"
-#include "libpq/crypt.h"
-#include "libpq/ip.h"
-#include "postmaster/postmaster.h"
 #include "catalog/pg_database.h"
 
-#include <event2/event.h>
 #include <event2/http.h>
-#include <event2/buffer.h>
-#include <event2/listener.h>
 #include <event2/util.h>
 #include <event2/keyvalq_struct.h>
-#include <event2/bufferevent.h>
 
-#include <sys/queue.h>
-#include <time.h>
-
-#include "util.h"
-#include "backend.h"
-#include "master.h"
-#include "bgwutil.h"
-#include "sendrecvfd.h"
-#include "response_phrase.h"
 #include "routes.h"
-
+#include "jsonbuf.h"
+#include "util.h"
 
 void
 root_route_GET(struct restgres_request *req)
 {
+	int ret;
+	HeapTuple spi_tuple;
+	SPITupleTable *spi_tuptable = SPI_tuptable;
+	TupleDesc spi_tupdesc = spi_tuptable->tupdesc;
+	char *datname;
+	char *url;
+	struct jsonbuf *jp = req->jsonbuf;
 	add_json_content_type_header(req->reply_headers);
-	evbuffer_add_cstring(req->reply_buffer, "{\r\n");
-	evbuffer_add_json_cstring_pair(req->reply_buffer, "version", PG_VERSION_STR);
-	evbuffer_add_crlf(req->reply_buffer);
-	evbuffer_add_cstring(req->reply_buffer, "}\r\n");
+	jsonbuf_start_document(jp);
+	jsonbuf_member_cstring(jp, "version", PG_VERSION_STR);
+
+	jsonbuf_member_start_object(jp, "databases");
+
+
+	ret = SPI_execute("SELECT datname FROM pg_database WHERE datistemplate = false;", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(FATAL, "SPI_execute failed: error code %d", ret);
+	for (int i = 0; i < SPI_processed; i++)
+	{
+		spi_tuptable = SPI_tuptable;
+		spi_tupdesc = spi_tuptable->tupdesc;
+		spi_tuple = SPI_tuptable->vals[i];
+		datname = evhttp_encode_uri(SPI_getvalue(spi_tuple, spi_tupdesc, 1));
+		url = psprintf("/databases/%s", datname);
+		free(datname);
+		jsonbuf_member_start_object(jp, datname);
+		/* TODO Include some interesting information about the database */
+		jsonbuf_member_cstring(jp, "url", url);
+		pfree(url);
+		jsonbuf_end_object(jp);
+	}
+
+	jsonbuf_end_object(jp);
+
+	jsonbuf_end_document(jp);
+
+
 }

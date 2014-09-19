@@ -60,23 +60,24 @@ SIMPLEQ_HEAD(queued_requests, restgres_queued_request) queued_requests = SIMPLEQ
 #define MAXLISTEN 64
 struct evhttp_bound_socket *listen_handles[MAXLISTEN];
 
-
+static const char *
+parse_dbname(const char *path);
 static void
 restgres_http_cb(struct evhttp_request *req, void *arg);
 static const char *
 check_authenticated(struct evhttp_request *req, const char *dbname);
 static void
-enqueue_request(const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd);
+enqueue_request(const char *dbname, const char *username, struct evbuffer *buf, struct evhttp_request *req);
 static void
 terminate_backend(struct restgres_backend* backend);
 static void
 worker_listener_error_cb(struct evconnlistener *lev, void *arg);
 static void
-write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, int reply_fd);
+write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, struct evhttp_request *req);
 static struct restgres_backend *
-get_backend(struct event_base *base, const char *dbname, const char *user_name);
+get_backend(struct event_base *base, const char *dbname, const char *username);
 static void
-send_to_backend(struct event_base *base, const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd);
+send_to_backend(struct event_base *base, const char *dbname, const char *username, struct evbuffer *buf, struct evhttp_request *req);
 static void
 backend_idle(struct event_base *base, struct restgres_backend *backend);
 
@@ -90,10 +91,10 @@ static long long int message_counter = 0;
 static bool is_anonymous(struct evhttp_request *req)
 {
 	struct evkeyvalq *headers;
-	const char *user_name;
+	const char *username;
 	headers = evhttp_request_get_input_headers(req);
-	user_name = evhttp_find_header(headers, "x-postgresql-user");
-	return user_name == NULL;
+	username = evhttp_find_header(headers, "x-postgresql-user");
+	return username == NULL;
 }
 static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 {
@@ -106,11 +107,11 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 	int sockaddrlen = sizeof _port.raddr.addr;
 	int rc = STATUS_ERROR;
 	char *logdetail = "auth failed";
-	const char *user_name;
+	const char *username;
 
 	headers = evhttp_request_get_input_headers(req);
-	user_name = port->user_name = (char *) evhttp_find_header(headers, "x-postgresql-user");
-	if(user_name == NULL)
+	username = port->user_name = (char *) evhttp_find_header(headers, "x-postgresql-user");
+	if(username == NULL)
 	{
 		logdetail = "No username provided.";
 		return false;
@@ -240,10 +241,10 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 		break;
 
 	case uaMD5:
-//			if (Db_user_namespace)
+//			if (Db_usernamespace)
 //				ereport(FATAL,
 //						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-//						 errmsg("MD5 authentication is not supported when \"db_user_namespace\" is enabled")));
+//						 errmsg("MD5 authentication is not supported when \"db_usernamespace\" is enabled")));
 	case uaPassword:
 		if (password == NULL || password[0] == 0)
 		{
@@ -267,7 +268,7 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 	}
 
 	if(rc == STATUS_OK)
-		return user_name;
+		return username;
 	else
 		return NULL;
 }
@@ -287,14 +288,14 @@ static const char *check_authenticated(struct evhttp_request *req, const char *d
 	}
 	else
 	{
-		const char *user_name = is_logged_in(req, dbname);
-		if (user_name == NULL)
+		const char *username = is_logged_in(req, dbname);
+		if (username == NULL)
 		{
 			evhttp_send_error(req, 403, "Bad credentials");
 			return NULL;
 		}
 
-		return user_name;
+		return username;
 	}
 }
 
@@ -350,42 +351,70 @@ static void listen_for_http_connections(struct evhttp *http)
 
 }
 
+/* Receive replies from a worker and send them to the client */
 static void
 worker_data_cb(struct bufferevent *bev, void *ctx)
 {
 	struct restgres_backend *backend = ctx;
 	struct evbuffer *input = bufferevent_get_input(bev);
-	if(evbuffer_get_length(input) > 1)
+	struct evhttp_request *req = backend->req;
+	struct evbuffer *reply_buffer = evhttp_request_get_output_buffer(req);
+
+	/* elog(LOG, "Data available from worker: %d bytes, backend state == %d: %.*s", (int)evbuffer_get_length(input), backend->state, (int)evbuffer_get_length(input), (char*)evbuffer_pullup(input, -1)); */
+
+	if(!req)
 	{
-		evbuffer_drain(input, evbuffer_get_length(input)-1);
+		elog(FATAL, "Got response from backend that has no request assigned to it; terminating the backend.");
+		terminate_backend(backend);
+		return;
+	}
+	if(backend->state == RestgresBackend_Busy && evbuffer_remove_netstring_buffer(input, reply_buffer) == 0)
+	{
+		/* Extract and parse headers */
+		const char *status_code_str;
+		const char *content_length_str;
+
+		evbuffer_parse_scgi_headers(reply_buffer, req->output_headers);
+
+		content_length_str = evhttp_find_header(req->output_headers, "Content-Length");
+		backend->reply_content_length = (content_length_str == NULL ? 0 : strtol(content_length_str, NULL, 10));
+
+		status_code_str = evhttp_find_header(req->output_headers, "STATUS");
+		backend->reply_status_code = (status_code_str == NULL ? 200 : strtol(status_code_str, NULL, 10));
+		if(status_code_str)
+			evhttp_remove_header(req->output_headers, "STATUS");
+
+		backend->state = RestgresBackend_Reading_Response_Body;
 	}
 
-	if(evbuffer_get_length(input) == 1)
+	/* Read the reply body */
+	if(backend->state == RestgresBackend_Reading_Response_Body)
 	{
-		char ch = 0;
-		evbuffer_remove(input, &ch, 1);
-		switch(ch)
+		/* Try to pull the response body data from the incoming data */
+		evbuffer_remove_buffer(input, reply_buffer, backend->reply_content_length - evbuffer_get_length(reply_buffer));
+
+		/* If we read the entire response, send the response to the HTTP client and mark the backend as idle */
+		if(evbuffer_get_length(reply_buffer) == backend->reply_content_length)
 		{
-		case 0: break;
-		case 'I':
-			/* Worker will notify us when it is idle */
+			evhttp_send_reply(req, backend->reply_status_code, NULL, NULL);
+
+			backend->req = NULL; /* backend_send_reply frees the request, so don't keep a pointer to it */
+			backend->reply_status_code = 0;
+			backend->reply_content_length = 0;
 			backend->state = RestgresBackend_Idle;
-
 			backend_idle(bufferevent_get_base(bev), backend);
-
-			break;
-		case 'B':
-			/* Worker will notify us when it is idle */
-			backend->state = RestgresBackend_Busy;
-			break;
 		}
 	}
+
 }
 
 static void
 worker_event_cb(struct bufferevent *bev, short what, void *ctx)
 {
 	struct restgres_backend *backend = ctx;
+
+	elog(WARNING, "Backend died unexpectedly, pid %d, user %s, db %s", backend->pid, backend->username, backend->dbname);
+
 	/* The only events we'd get here would be errors */
 	terminate_backend(backend);
 }
@@ -407,17 +436,20 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 	{
 		if(backends[i].state == RestgresBackend_Starting)
 		{
+			struct restgres_backend *backend = &backends[i];
+			struct bufferevent* bev = backend->bev;
 			/* Check PID if we can */
 			if(connected_pid != -1)
 			{
-				BgwHandleStatus status = GetBackgroundWorkerPid(backends[i].bgworker_handle, &backends[i].pid);
+				BgwHandleStatus status = GetBackgroundWorkerPid(backend->bgworker_handle, &backend->pid);
 				if(status != BGWH_STARTED)
 					continue;
-				if(connected_pid != backends[i].pid)
+				if(connected_pid != backend->pid)
 					continue;
 			}
-			bufferevent_setfd(backends[i].bev, fd);
-			bufferevent_setcb(backends[i].bev, worker_data_cb, NULL, worker_event_cb, &backends[i]);
+			bufferevent_setcb(bev, worker_data_cb, NULL, worker_event_cb, &backends[i]);
+			bufferevent_setfd(bev, fd);
+			bufferevent_enable(bev, EV_READ);
 			backends[i].state = RestgresBackend_Idle;
 			return;
 		}
@@ -520,18 +552,25 @@ terminate_backend(struct restgres_backend* backend)
 		free(backend->username);
 		backend->username = NULL;
 	}
+
+	if(backend->req)
+	{
+		evhttp_request_free(backend->req);
+		backend->req = NULL;
+	}
+
 	backend->state = RestgresBackend_Unused;
 }
 
 static struct restgres_backend *
-init_backend(struct restgres_backend *backend, struct event_base *base, const char *dbname, const char *user_name)
+init_backend(struct restgres_backend *backend, struct event_base *base, const char *dbname, const char *username)
 {
 	BackgroundWorker worker = { "" };
 	struct evbuffer *output;
 	struct evbuffer *meta_temp;
 	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 
-	elog(LOG, "New restgres backend needed, db = %s, user = %s", dbname, user_name);
+	elog(LOG, "New restgres backend needed, db = %s, user = %s", dbname, username);
 
 	/* Recycle the backend if necessary */
 	terminate_backend(backend);
@@ -539,17 +578,17 @@ init_backend(struct restgres_backend *backend, struct event_base *base, const ch
 	backend->state = RestgresBackend_Starting;
 	backend->bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS);
 	backend->dbname = pstrdup(dbname);
-	backend->username = pstrdup(user_name);
+	backend->username = pstrdup(username);
 
-	/* The first thing the backend will receive is the database and user_name */
+	/* The first thing the backend will receive is the database and username */
 	output = bufferevent_get_output(backend->bev);
 	meta_temp = evbuffer_new();
 	evbuffer_add_netstring_cstring(output, dbname);
-	evbuffer_add_netstring_cstring(output, user_name);
+	evbuffer_add_netstring_cstring(output, username);
 	evbuffer_free(meta_temp);
 
 	worker.bgw_main = restgres_backend_main;
-	evutil_snprintf(worker.bgw_name, sizeof worker.bgw_name, "restgres %s %s", dbname, user_name);
+	evutil_snprintf(worker.bgw_name, sizeof worker.bgw_name, "restgres %s %s", dbname, username);
 
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -563,7 +602,7 @@ init_backend(struct restgres_backend *backend, struct event_base *base, const ch
 }
 
 static struct restgres_backend *
-get_backend(struct event_base *base, const char *dbname, const char *user_name)
+get_backend(struct event_base *base, const char *dbname, const char *username)
 {
 	int slot_to_reuse = -1;
 	int slot_to_reuse_last_used = INT_MAX;
@@ -577,7 +616,7 @@ get_backend(struct event_base *base, const char *dbname, const char *user_name)
 			slot_to_reuse_last_used = 0;
 			break;
 		case RestgresBackend_Idle:
-			if(streql(backends[i].dbname, dbname) && streql(backends[i].username, user_name))
+			if(streql(backends[i].dbname, dbname) && streql(backends[i].username, username))
 			{
 				/* Just what we were looking for! */
 				return &backends[i];
@@ -590,6 +629,7 @@ get_backend(struct event_base *base, const char *dbname, const char *user_name)
 			break;
 		case RestgresBackend_Starting:
 		case RestgresBackend_Busy:
+		case RestgresBackend_Reading_Response_Body:
 			/* Don't touch! */
 			break;
 		}
@@ -599,17 +639,18 @@ get_backend(struct event_base *base, const char *dbname, const char *user_name)
 		elog(ERROR, "All backends are busy, cannot allocate a new backend!");
 		return NULL;
 	}
-	return init_backend(&backends[slot_to_reuse], base, dbname, user_name);
+	return init_backend(&backends[slot_to_reuse], base, dbname, username);
 }
 
 static void
-enqueue_request(const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd) {
+enqueue_request(const char *dbname, const char *username, struct evbuffer *buf, struct evhttp_request *req) {
 	struct restgres_queued_request *x = malloc(sizeof (struct restgres_queued_request));
 	x->dbname = strdup(dbname);
-	x->username = strdup(user_name);
+	x->username = strdup(username);
 	x->request = evbuffer_new();
 	evbuffer_remove_buffer(buf, x->request, evbuffer_get_length(buf));
-	x->reply_fd = reply_fd;
+	evhttp_request_own(req);
+	x->req = req;
 	SIMPLEQ_INSERT_TAIL(&queued_requests, x, next);
 }
 
@@ -620,7 +661,7 @@ dequeue_request(struct restgres_queued_request *x)
 	free(x->dbname);
 	free(x->username);
 	evbuffer_free(x->request);
-	x->reply_fd = -1;
+	x->req = NULL;
 	free(x);
 }
 static void
@@ -636,7 +677,7 @@ backend_idle(struct event_base *base, struct restgres_backend *backend)
 	{
 		if(streql(backend->dbname, x->dbname) && streql(backend->username, x->username))
 		{
-			write_to_backend(backend, x->request, x->reply_fd);
+			write_to_backend(backend, x->request, x->req);
 			dequeue_request(x);
 			return;
 		}
@@ -649,33 +690,60 @@ backend_idle(struct event_base *base, struct restgres_backend *backend)
 	 * send_to_backend should do this for us.
 	 */
 	x = SIMPLEQ_FIRST(&queued_requests);
-	send_to_backend(base, x->dbname, x->username, x->request, x->reply_fd);
+	send_to_backend(base, x->dbname, x->username, x->request, x->req);
 	dequeue_request(x);
 }
 
 static void
-write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, int reply_fd)
+write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, struct evhttp_request *req)
 {
-	sendfd(bufferevent_getfd(backend->bev), reply_fd);
 	evbuffer_add_netstring_buffer(bufferevent_get_output(backend->bev), buf, true);
 	backend->last_used = message_counter++;
-	close(reply_fd); /* Close the fd, the backend should take it over and close it when it is done */
-
+	backend->req = req;
+	backend->state = RestgresBackend_Busy;
+	evhttp_request_own(req);
 }
+
 static void
-send_to_backend(struct event_base *base, const char *dbname, const char *user_name, struct evbuffer *buf, int reply_fd)
+send_to_backend(struct event_base *base, const char *dbname, const char *username, struct evbuffer *buf, struct evhttp_request *req)
 {
 	/* Get or launch a backend */
-	struct restgres_backend *backend = get_backend(base, dbname, user_name);
+	struct restgres_backend *backend = get_backend(base, dbname, username);
 	if(backend == NULL)
 	{
 		/* We'll get here if all the backends are already allocated to other username/db combinations */
 		/* TODO currently we enqueue these ... and never actually send them to the backend! */
-		enqueue_request(dbname, user_name, buf, reply_fd);
+		enqueue_request(dbname, username, buf, req);
 	}
 	else
 	{
-		write_to_backend(backend, buf, reply_fd);
+		write_to_backend(backend, buf, req);
+	}
+}
+
+/* Determine the requested database name from the URI given.  The result may or may not be allocated using palloc()  */
+static const char *
+parse_dbname(const char *path)
+{
+	const char *db_start;
+	const char *db_end;
+	if ((db_start = remove_prefix("/db/", path)) != NULL)
+	{
+		if((db_end = strchr(db_start, '/')) == NULL) // Didn't find any slash after the DB name
+		{
+			/* /databases/:dbname */
+			return db_start;
+		}
+		else
+		{
+			/* /databases/:dbname/... */
+			return pnstrdup(db_start, db_end - db_start); // Freed as part of the memory context
+		}
+	}
+	else
+	{
+		/* No database selected, use "postgres" as the database for global operations. */
+		return "postgres";
 	}
 }
 
@@ -688,39 +756,18 @@ dispatch_request(struct evhttp_request *req)
 	struct evhttp_connection* conn = evhttp_request_get_connection(req);
 	struct event_base* base = evhttp_connection_get_base(conn);
 	const char *path;
-	const char *db_start;
-	const char *user_name;
 	const char *dbname;
-	const char *db_end;
+	const char *username;
 	struct evbuffer *input;
 	struct evbuffer *header_buf;
 	struct evbuffer *buf;
 	struct evkeyvalq *headers;
 	struct evkeyval *header;
-	int reply_fd;
 
 	path = evhttp_request_get_uri(req);
-	if ((db_start = remove_prefix("/db/", path)) != NULL)
-	{
-		if((db_end = strchr(db_start, '/')) == NULL) // Didn't find any slash after the DB name
-		{
-			/* /databases/:dbname */
-			dbname = db_start;
-		}
-		else
-		{
-			/* /databases/:dbname/... */
-			dbname = pnstrdup(db_start, db_end - db_start); // Freed as part of the memory context
-		}
-	}
-	else
-	{
-		/* No database selected, use "postgres" as the database for global operations. */
-		dbname = "postgres";
-	}
-
-	user_name = check_authenticated(req, dbname);
-	if(user_name == NULL)
+	dbname = parse_dbname(path);
+	username = check_authenticated(req, dbname);
+	if(username == NULL)
 	{
 		// Auth failed, an error was already sent back
 		return;
@@ -730,13 +777,10 @@ dispatch_request(struct evhttp_request *req)
 	header_buf = evbuffer_new();
 	buf = evbuffer_new();
 	headers = evhttp_request_get_input_headers(req);
-	reply_fd = bufferevent_getfd(evhttp_connection_get_bufferevent(evhttp_request_get_connection(req)));
 
 	// SCGI formatted request
 	evbuffer_add_netstring_cstring(header_buf, "CONTENT_LENGTH");
 	evbuffer_add_netstring_printf(header_buf, "%d", (int)evbuffer_get_length(input));
-	evbuffer_add_netstring_cstring(header_buf, "SCGI");
-	evbuffer_add_netstring_cstring(header_buf, "1");
 	evbuffer_add_netstring_cstring(header_buf, "HTTP");
 	evbuffer_add_netstring_printf(header_buf, "%d.%d", req->major, req->minor);
 	evbuffer_add_netstring_cstring(header_buf, "REQUEST_METHOD");
@@ -753,7 +797,7 @@ dispatch_request(struct evhttp_request *req)
 	evbuffer_free(header_buf);
 
 	evbuffer_add_buffer(buf, input);
-	send_to_backend(base, dbname, user_name, buf, reply_fd);
+	send_to_backend(base, dbname, username, buf, req);
 	evbuffer_free(buf);
 }
 
@@ -822,7 +866,7 @@ void restgres_main(Datum main_arg)
 	/* Start up at least one backend, for testing */
 	get_backend(base, "postgres", "postgres");
 
-	elog(LOG, "restgres initialized, pid %d port %d listen_addresses \"%s\"",
+	elog(LOG, "restgres master initialized, pid %d port %d listen_addresses \"%s\"",
 			getpid(), restgres_listen_port, restgres_listen_addresses);
 
 	event_base_dispatch(base);

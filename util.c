@@ -191,7 +191,8 @@ evbuffer_add_netstring_cstring(struct evbuffer *buf, const char *string)
 	else
 	{
 		int len = strlen(string);
-		evbuffer_add_printf(buf, "%d:%s", len, string);
+		evbuffer_add_printf(buf, "%d:", len);
+		evbuffer_add_cstring(buf, string);
 	}
 }
 
@@ -360,6 +361,11 @@ read_netstring_buffer(pgsocket fd, struct evbuffer *input, struct evbuffer *outp
 		rc = evbuffer_read(input, fd, remaining > 0 ? remaining : read_size);
 		if(rc < 0)
 			return rc;
+		if(rc == 0) /* EOF */
+		{
+			errno = EPIPE;
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -370,7 +376,7 @@ read_netstring_cstring(pgsocket fd, struct evbuffer *input, int read_size)
 	char *result=NULL;
 	while(evbuffer_get_length(input) == 0 || (result = evbuffer_remove_netstring_cstring(input)) == NULL)
 	{
-		if(evbuffer_read(input, fd, read_size) < 0)
+		if(evbuffer_read(input, fd, read_size) <= 0)
 			return NULL;
 	}
 	return result;
@@ -580,3 +586,23 @@ add_json_content_type_header(struct evkeyvalq *headers)
 	evhttp_add_header(headers, "Content-Type", "application/json; charset=utf-8");
 }
 
+
+int
+evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers)
+{
+	char *key;
+	/* elog(LOG, "Headers: %.*s", (int)evbuffer_get_length(input), (char *)evbuffer_pullup(input, -1)); */
+	while((key = evbuffer_remove_netstring_cstring(input)) != NULL)
+	{
+		char *value = evbuffer_remove_netstring_cstring(input);
+		if(value == NULL)
+			break;
+		evhttp_add_header(headers, key, value);
+		/* elog(LOG, "Got header; %s: %s", key, value); */
+	}
+	if(evbuffer_get_length(input) != 0)
+	{
+		return -1;
+	}
+	return 0;
+}

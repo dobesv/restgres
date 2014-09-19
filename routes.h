@@ -21,6 +21,7 @@ struct restgres_request
 	struct evkeyvalq *reply_headers;
 	struct evbuffer *reply_buffer;
 	struct evkeyvalq *matchdict;
+	struct jsonbuf *jsonbuf;
 };
 typedef void (*restgres_request_handler)(struct restgres_request *req);
 

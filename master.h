@@ -14,6 +14,7 @@ typedef enum
 	RestgresBackend_Idle,
 	RestgresBackend_Starting,
 	RestgresBackend_Busy,
+	RestgresBackend_Reading_Response_Body,
 } RestgresBackendState;
 
 struct restgres_backend
@@ -25,6 +26,9 @@ struct restgres_backend
 	char *dbname;
 	char *username;
 	int last_used;
+	struct evhttp_request *req;
+	int reply_status_code;
+	int reply_content_length;
 };
 
 struct restgres_queued_request
@@ -33,7 +37,7 @@ struct restgres_queued_request
 	char *dbname;
 	char *username;
 	struct evbuffer *request;
-	int reply_fd;
+	struct evhttp_request *req;
 };
 
 extern struct restgres_backend *backends;
