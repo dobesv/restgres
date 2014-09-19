@@ -305,7 +305,6 @@ void restgres_backend_main(Datum main_arg)
 				/* Don't send any body if the request is a HEAD request */
 				if(req.cmd_type == EVHTTP_REQ_HEAD)
 				{
-					elog(LOG, "Header is a HEAD request, discarding body of response (if any)");
 					evbuffer_drain(reply_body_buffer, evbuffer_get_length(reply_body_buffer));
 				}
 
@@ -327,8 +326,6 @@ void restgres_backend_main(Datum main_arg)
 				}
 
 				/* Write out the reply */
-				elog(LOG, "Sending %d byte reply back to master.", (int)evbuffer_get_length(reply_buffer));
-
 				while(evbuffer_get_length(reply_buffer) > 0)
 				{
 					if(evbuffer_write(reply_buffer, fd) < 0)
@@ -338,8 +335,6 @@ void restgres_backend_main(Datum main_arg)
 						break;
 					}
 				}
-
-				elog(LOG, "Sent reply back to master, waiting for next request.");
 
 				MemoryContextSwitchTo(oldcontext);
 				MemoryContextReset(request_context);
