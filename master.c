@@ -394,7 +394,7 @@ worker_data_cb(struct bufferevent *bev, void *ctx)
 	struct evhttp_request *req = backend->req;
 	struct evbuffer *reply_buffer = evhttp_request_get_output_buffer(req);
 
-	elog(LOG, "Data available from worker: %d bytes, backend state == %d: %.*s", (int)evbuffer_get_length(input), backend->state, (int)evbuffer_get_length(input), (char*)evbuffer_pullup(input, -1));
+	/* elog(LOG, "Data available from worker: %d bytes, backend state == %d: %.*s", (int)evbuffer_get_length(input), backend->state, (int)evbuffer_get_length(input), (char*)evbuffer_pullup(input, -1)); */
 
 	if(!req)
 	{
