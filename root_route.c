@@ -36,13 +36,14 @@ root_route_GET(struct restgres_request *req)
 	SPITupleTable *spi_tuptable = SPI_tuptable;
 	TupleDesc spi_tupdesc = spi_tuptable->tupdesc;
 	char *datname;
+	char *datname_uri;
 	char *url;
 	struct jsonbuf *jp = req->jsonbuf;
 	add_json_content_type_header(req->reply_headers);
 	jsonbuf_start_document(jp);
 	jsonbuf_member_cstring(jp, "version", PG_VERSION_STR);
 
-	jsonbuf_member_start_object(jp, "databases");
+	jsonbuf_member_start_array(jp, "databases");
 
 
 	ret = SPI_execute("SELECT datname FROM pg_database WHERE datistemplate = false;", true, 0);
@@ -53,17 +54,21 @@ root_route_GET(struct restgres_request *req)
 		spi_tuptable = SPI_tuptable;
 		spi_tupdesc = spi_tuptable->tupdesc;
 		spi_tuple = SPI_tuptable->vals[i];
-		datname = evhttp_encode_uri(SPI_getvalue(spi_tuple, spi_tupdesc, 1));
-		url = psprintf("/databases/%s", datname);
-		free(datname);
+		datname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
+		datname_uri = evhttp_encode_uri(datname);
+		url = psprintf("/databases/%s", datname_uri);
+
 		jsonbuf_member_start_object(jp, datname);
 		/* TODO Include some interesting information about the database */
+		jsonbuf_member_cstring(jp, "name", datname);
 		jsonbuf_member_cstring(jp, "url", url);
-		pfree(url);
 		jsonbuf_end_object(jp);
+
+		free(datname_uri);
+		pfree(url);
 	}
 
-	jsonbuf_end_object(jp);
+	jsonbuf_end_array(jp);
 
 	jsonbuf_end_document(jp);
 

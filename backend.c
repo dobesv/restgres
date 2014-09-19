@@ -187,8 +187,8 @@ void restgres_backend_main(Datum main_arg)
 	}
 
 	/* This must be the initial packet telling us what database to connect to */
-	dbname = read_netstring_cstring(fd, input, 1000);
-	username = read_netstring_cstring(fd, input, 1000);
+	dbname = read_netstring_cstring(fd, input, 32);
+	username = read_netstring_cstring(fd, input, 32);
 	if(dbname == NULL || username == NULL)
 	{
 		elog(FATAL, "Failed to read database and username from master");

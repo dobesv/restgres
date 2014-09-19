@@ -21,6 +21,7 @@
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 #include "tcop/utility.h"
 #include "libpq/libpq.h"
 #include "libpq/crypt.h"
@@ -96,6 +97,37 @@ static bool is_anonymous(struct evhttp_request *req)
 	username = evhttp_find_header(headers, "x-postgresql-user");
 	return username == NULL;
 }
+
+static int role_exists(const char *role)
+{
+	HeapTuple	roleTup;
+	int rc;
+	/*
+	 * Disable immediate interrupts while doing database access.  (Note we
+	 * don't bother to turn this back on if we hit one of the failure
+	 * conditions, since we can expect we'll just exit right away anyway.)
+	 */
+	ImmediateInterruptOK = false;
+
+	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+	if (!HeapTupleIsValid(roleTup))
+	{
+		rc = STATUS_ERROR;	/* no such user */
+	}
+	else
+	{
+		ReleaseSysCache(roleTup);
+		rc = STATUS_OK;
+	}
+
+	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
+	ImmediateInterruptOK = true;
+	/* And don't forget to detect one that already arrived */
+	CHECK_FOR_INTERRUPTS();
+
+	return rc;
+}
+
 static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 {
 	struct evkeyvalq *headers;
@@ -263,7 +295,9 @@ static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
 		break;
 
 	case uaTrust:
-		rc = STATUS_OK;
+		/* Require only that they provided a username that exists */
+		rc = role_exists(port->user_name);
+		logdetail = "Invalid username";
 		break;
 	}
 
@@ -360,7 +394,7 @@ worker_data_cb(struct bufferevent *bev, void *ctx)
 	struct evhttp_request *req = backend->req;
 	struct evbuffer *reply_buffer = evhttp_request_get_output_buffer(req);
 
-	/* elog(LOG, "Data available from worker: %d bytes, backend state == %d: %.*s", (int)evbuffer_get_length(input), backend->state, (int)evbuffer_get_length(input), (char*)evbuffer_pullup(input, -1)); */
+	elog(LOG, "Data available from worker: %d bytes, backend state == %d: %.*s", (int)evbuffer_get_length(input), backend->state, (int)evbuffer_get_length(input), (char*)evbuffer_pullup(input, -1));
 
 	if(!req)
 	{
@@ -413,9 +447,15 @@ worker_event_cb(struct bufferevent *bev, short what, void *ctx)
 {
 	struct restgres_backend *backend = ctx;
 
+	/* The only events we'd get here would be errors indicating we lost connection to the backend */
+
 	elog(WARNING, "Backend died unexpectedly, pid %d, user %s, db %s", backend->pid, backend->username, backend->dbname);
 
-	/* The only events we'd get here would be errors */
+	if(backend->req)
+	{
+		evhttp_send_error(backend->req, 500, NULL);
+		backend->req = NULL;
+	}
 	terminate_backend(backend);
 }
 
@@ -424,6 +464,9 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 	pid_t connected_pid=-1;
 	uid_t uid;
 	gid_t gid;
+	int wrong_state = 0;
+	int wrong_pid = 0;
+	int not_started = 0;
 
 	if(getpeerpideid(fd, &connected_pid, &uid, &gid) == -1)
 	{
@@ -434,7 +477,11 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 	/* TODO Should we validate the client is really a restgres worker somehow ? */
 	for(int i=0; i < restgres_max_concurrency; i++)
 	{
-		if(backends[i].state == RestgresBackend_Starting)
+		if(backends[i].state != RestgresBackend_Starting)
+		{
+			wrong_state++;
+		}
+		else
 		{
 			struct restgres_backend *backend = &backends[i];
 			struct bufferevent* bev = backend->bev;
@@ -443,19 +490,25 @@ static void worker_connect_cb(struct evconnlistener *listener, evutil_socket_t f
 			{
 				BgwHandleStatus status = GetBackgroundWorkerPid(backend->bgworker_handle, &backend->pid);
 				if(status != BGWH_STARTED)
+				{
+					not_started++;
 					continue;
+				}
 				if(connected_pid != backend->pid)
+				{
+					wrong_pid++;
 					continue;
+				}
 			}
-			bufferevent_setcb(bev, worker_data_cb, NULL, worker_event_cb, &backends[i]);
 			bufferevent_setfd(bev, fd);
-			bufferevent_enable(bev, EV_READ);
-			backends[i].state = RestgresBackend_Idle;
+			bufferevent_setcb(bev, worker_data_cb, NULL, worker_event_cb, &backends[i]);
+			bufferevent_enable(bev, EV_READ|EV_WRITE);
+			backend->state = backend->req != NULL ? RestgresBackend_Busy : RestgresBackend_Idle;
 			return;
 		}
 	}
 
-	elog(FATAL, "Background worker connected, but we have no slot waiting for them!");
+	elog(ERROR, "Background worker connected, but we have no slot waiting for them; found %d where state != Starting, %d slots not yet started, and %d slots Starting with the wrong pid", wrong_state, not_started, wrong_pid);
 	closesocket(fd);
 }
 
@@ -543,13 +596,13 @@ terminate_backend(struct restgres_backend* backend)
 
 	if (backend->dbname)
 	{
-		free(backend->dbname);
+		pfree(backend->dbname);
 		backend->dbname = NULL;
 	}
 
 	if (backend->username)
 	{
-		free(backend->username);
+		pfree(backend->username);
 		backend->username = NULL;
 	}
 
@@ -700,7 +753,8 @@ write_to_backend(struct restgres_backend *backend, struct evbuffer *buf, struct 
 	evbuffer_add_netstring_buffer(bufferevent_get_output(backend->bev), buf, true);
 	backend->last_used = message_counter++;
 	backend->req = req;
-	backend->state = RestgresBackend_Busy;
+	if(backend->state == RestgresBackend_Idle)
+		backend->state = RestgresBackend_Busy;
 	evhttp_request_own(req);
 }
 
@@ -803,9 +857,6 @@ dispatch_request(struct evhttp_request *req)
 
 static void restgres_http_cb(struct evhttp_request *req, void *arg)
 {
-	struct evkeyvalq *headers;
-	struct evkeyval *header;
-	struct evbuffer *buf;
 	MemoryContext oldcontext;
 	AssertArg(MemoryContextIsValid(request_context));
 	oldcontext = MemoryContextSwitchTo(request_context);
@@ -816,23 +867,6 @@ static void restgres_http_cb(struct evhttp_request *req, void *arg)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "Handling request");
 	elog(LOG, "%s %s", cmd_type_method(evhttp_request_get_command(req)), evhttp_request_get_uri(req));
-
-	headers = evhttp_request_get_input_headers(req);
-	for (header = headers->tqh_first; header; header = header->next.tqe_next)
-	{
-		elog(LOG, "  %s: %s", header->key, header->value);
-	}
-
-	buf = evhttp_request_get_input_buffer(req);
-	elog(LOG, "Input data:");
-	while (evbuffer_get_length(buf))
-	{
-		int n;
-		char cbuf[128];
-		n = evbuffer_remove(buf, cbuf, sizeof(cbuf));
-		if (n > 0)
-			(void) fwrite(cbuf, 1, n, stdout);
-	}
 
 	dispatch_request(req);
 
