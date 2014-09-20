@@ -39,6 +39,14 @@ jsonbuf_member_cstring(struct jsonbuf *jp, const char *key, const char *value);
 void
 jsonbuf_member_int(struct jsonbuf *jp, const char *key, int value);
 
+/* Add a member to an object with an bool value */
+void
+jsonbuf_member_bool(struct jsonbuf *jp, const char *key, bool value);
+
+/* Add a null valued member to an object */
+void
+jsonbuf_member_null(struct jsonbuf *jp, const char *key);
+
 /* Add a member to an object whose value is an object.  Call jsonbuf_end_object when done adding members */
 void
 jsonbuf_member_start_object(struct jsonbuf *jp, const char *key);
@@ -55,9 +63,22 @@ jsonbuf_member_start_array(struct jsonbuf *jp, const char *key);
 void
 jsonbuf_element_cstring(struct jsonbuf *jp, const char *value);
 
+/*
+ * Add a link dict as the value for the key; the value is a dict with the given href, rel, and type
+ *
+ * If href, rel, and/or type are NULL the attribute will be omitted; generally, however, at least href should
+ * be included.
+ */
+void
+jsonbuf_element_link(struct jsonbuf *jp, const char *rel, const char *type, const char *href);
+
 /* Add an array element that is an int */
 void
 jsonbuf_element_int(struct jsonbuf *jp, int value);
+
+/* Add a boolean value to an array */
+void
+jsonbuf_element_bool(struct jsonbuf *jp, bool value);
 
 /* Add an array element that is an object */
 void

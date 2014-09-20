@@ -44,7 +44,6 @@
 #include "backend.h"
 #include "master.h"
 #include "bgwutil.h"
-#include "sendrecvfd.h"
 #include "response_phrase.h"
 #include "routes.h"
 #include "jsonbuf.h"
@@ -295,6 +294,11 @@ void restgres_backend_main(Datum main_arg)
 					PopActiveSnapshot();
 					CommitTransactionCommand();
 					pgstat_report_activity(STATE_IDLE, NULL);
+
+					if(best_route->response_content_type != NULL && evhttp_find_header(&reply_headers, "Content-Type") == NULL)
+					{
+						evhttp_add_header(&reply_headers, "Content-Type", best_route->response_content_type);
+					}
 				}
 				else
 				{

@@ -29,6 +29,10 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/bgworker.h"
 #include "catalog/pg_database.h"
+#include "catalog/indexing.h"
+#include "utils/fmgroids.h"
+#include "access/htup_details.h"
+#include "storage/lmgr.h"
 
 #include <event2/event.h>
 #include <event2/http.h>
@@ -45,7 +49,6 @@
 #include "util.h"
 #include "backend.h"
 #include "master.h"
-#include "sendrecvfd.h"
 
 /* GUC variables */
 int restgres_listen_port;
@@ -98,7 +101,8 @@ static bool is_anonymous(struct evhttp_request *req)
 	return username == NULL;
 }
 
-static int role_exists(const char *role)
+static int
+role_exists(const char *role)
 {
 	HeapTuple	roleTup;
 	int rc;
@@ -128,7 +132,74 @@ static int role_exists(const char *role)
 	return rc;
 }
 
-static const char *is_logged_in(struct evhttp_request *req, const char *dbname)
+static bool
+database_exists(const char *dbname)
+{
+	Relation	relation;
+	bool        exists = false;
+
+	relation = heap_open(DatabaseRelationId, AccessShareLock);
+
+	do
+	{
+		ScanKeyData scanKey;
+		SysScanDesc scan;
+		HeapTuple	tuple;
+		Oid			dbOid;
+
+		/*
+		 * there's no syscache for database-indexed-by-name, so must do it the
+		 * hard way
+		 */
+		ScanKeyInit(&scanKey,
+					Anum_pg_database_datname,
+					BTEqualStrategyNumber, F_NAMEEQ,
+					NameGetDatum(dbname));
+
+		scan = systable_beginscan(relation, DatabaseNameIndexId, true,
+								  NULL, 1, &scanKey);
+
+		tuple = systable_getnext(scan);
+
+		if (!HeapTupleIsValid(tuple))
+		{
+			/* definitely no database of that name */
+			systable_endscan(scan);
+			break;
+		}
+
+		dbOid = HeapTupleGetOid(tuple);
+
+		systable_endscan(scan);
+
+		/*
+		 * Now that we have a database OID, we can try to lock the DB.
+		 */
+		LockSharedObject(DatabaseRelationId, dbOid, 0, ShareLock);
+
+		/*
+		 * And now, re-fetch the tuple by OID.  If it's still there and still
+		 * the same name, we win; else, drop the lock and loop back to try
+		 * again.
+		 */
+		tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbOid));
+		if (HeapTupleIsValid(tuple))
+		{
+			Form_pg_database dbform = (Form_pg_database) GETSTRUCT(tuple);
+			exists = (strcmp(dbname, NameStr(dbform->datname)) == 0);
+			ReleaseSysCache(tuple);
+		}
+
+		UnlockSharedObject(DatabaseRelationId, dbOid, 0, ShareLock);
+	} while(!exists);
+
+	heap_close(relation, AccessShareLock);
+
+	return exists;
+}
+
+static const char *
+is_logged_in(struct evhttp_request *req, const char *dbname)
 {
 	struct evkeyvalq *headers;
 	const char *password;
@@ -329,6 +400,11 @@ static const char *check_authenticated(struct evhttp_request *req, const char *d
 			return NULL;
 		}
 
+		if(!database_exists(dbname))
+		{
+			evhttp_send_error(req, 404, "No such database");
+			return NULL;
+		}
 		return username;
 	}
 }

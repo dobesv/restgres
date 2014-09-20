@@ -11,13 +11,32 @@
 #include "backend.h"
 #include "util.h"
 #include "routes.h"
+#include "content_types.h"
 
 struct restgres_route routes[] = {
 		{
 				"root",
 				"/",
 				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				SERVER_METADATA_TYPE,
+				NULL,
 				root_route_GET,
+		},
+		{
+				"databases",
+				"/databases",
+				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				DATABASE_LIST_TYPE,
+				NULL,
+				databases_route_GET,
+		},
+		{
+				"database",
+				"/db/{dbname}",
+				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				DATABASE_LIST_TYPE,
+				NULL,
+				db_route_GET,
 		}
 };
 
@@ -54,7 +73,7 @@ match_route_uri_pattern(const char *path_input, const char *path_pattern)
 		}
 	}
 	/* If we did not match the entire input, then the route doesn't match */
-	if(*path_input)
+	if(*path_input || *path_pattern)
 		return -1;
 
 	return 1;

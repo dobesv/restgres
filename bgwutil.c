@@ -23,7 +23,6 @@
 #include "utils/snapmgr.h"
 #include "utils/memutils.h"
 #include "tcop/utility.h"
-#include "libpq/libpq.h"
 #include "libpq/crypt.h"
 #include "libpq/ip.h"
 #include "postmaster/postmaster.h"

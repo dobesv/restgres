@@ -117,8 +117,24 @@ jsonbuf_member_cstring(struct jsonbuf *jp, const char *key, const char *value)
 void
 jsonbuf_member_int(struct jsonbuf *jp, const char *key, int value)
 {
+	char buf[32];
+	sprintf(buf, "%d", value);
 	jsonbuf_member_start(jp, key);
-	evbuffer_add_printf(jp->buf, "%d", value);
+	evbuffer_add_cstring(jp->buf, buf);
+}
+
+void
+jsonbuf_member_null(struct jsonbuf *jp, const char *key)
+{
+	jsonbuf_member_start(jp, key);
+	evbuffer_add_cstring(jp->buf, "null");
+}
+
+void
+jsonbuf_member_bool(struct jsonbuf *jp, const char *key, bool value)
+{
+	jsonbuf_member_start(jp, key);
+	evbuffer_add_cstring(jp->buf, value?"true":"false");
 }
 
 void
@@ -166,10 +182,28 @@ jsonbuf_element_cstring(struct jsonbuf *jp, const char *value)
 }
 
 void
+jsonbuf_element_link(struct jsonbuf *jp, const char *rel, const char *type, const char *href)
+{
+	jsonbuf_element_start_object(jp);
+	if(rel) jsonbuf_member_cstring(jp, "rel", rel);
+	if(type) jsonbuf_member_cstring(jp, "type", type);
+	if(href) jsonbuf_member_cstring(jp, "href", href);
+	jsonbuf_end_object(jp);
+}
+
+void
 jsonbuf_element_int(struct jsonbuf *jp, int value)
 {
 	jsonbuf_element_start(jp);
 	evbuffer_add_printf(jp->buf, "%d", value);
+
+}
+
+void
+jsonbuf_element_bool(struct jsonbuf *jp, bool value)
+{
+	jsonbuf_element_start(jp);
+	evbuffer_add_printf(jp->buf, value ? "true" : "false");
 }
 
 void

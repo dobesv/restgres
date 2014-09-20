@@ -389,7 +389,10 @@ evbuffer_add_json_cstring(struct evbuffer *buf, const char *str)
 	const char *p;
 
 	if (str == NULL)
+	{
+		evbuffer_add_cstring(buf, "null");
 		return;
+	}
 	for (const char *p = str; *p; p++)
 	{
 		if (*p < ' ' || strchr("\"\b\f\n\r\t\\", *p) != NULL)

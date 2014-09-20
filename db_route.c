@@ -15,7 +15,6 @@
 #include "utils/snapmgr.h"
 #include "utils/memutils.h"
 #include "tcop/utility.h"
-#include "libpq/libpq.h"
 #include "catalog/pg_database.h"
 #include "catalog/indexing.h"
 #include "utils/fmgroids.h"
@@ -31,20 +30,15 @@
 #include "util.h"
 #include "content_types.h"
 
+/* When we get here, the database we are asking about is the one we are connected to ... */
 void
-root_route_GET(struct restgres_request *req)
+db_route_GET(struct restgres_request *req)
 {
 	struct jsonbuf *jp = req->jsonbuf;
+	add_json_content_type_header(req->reply_headers);
 	jsonbuf_start_document(jp);
-	jsonbuf_member_cstring(jp, "version", PG_VERSION_STR);
+	jsonbuf_member_start_object(jp, "database");
 
-	jsonbuf_member_start_array(jp, "links");
-	jsonbuf_element_link(jp, "tablespaces", TABLESPACE_LIST_TYPE, "/tablespaces");
-	jsonbuf_element_link(jp, "databases", DATABASE_LIST_TYPE, "/databases");
-	jsonbuf_element_link(jp, "roles", ROLE_LIST_TYPE, "/roles");
-	jsonbuf_end_array(jp);
-
+	jsonbuf_end_object(jp);
 	jsonbuf_end_document(jp);
-
-
 }
