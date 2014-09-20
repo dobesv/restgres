@@ -84,7 +84,7 @@ jsonbuf_add_databases(struct jsonbuf *jp)
 
 		jsonbuf_member_start_array(jp, "links");
 		datname_uri = evhttp_encode_uri(dbform->datname.data);
-		jsonbuf_element_link(jp, "self", DATABASE_METADATA_TYPE, psprintf("/databases/%s", datname_uri));
+		jsonbuf_element_link(jp, "self", DATABASE_METADATA_V1_TYPE, psprintf("/databases/%s", datname_uri));
 		free(datname_uri);
 
 		utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(dbform->datdba));
@@ -92,7 +92,7 @@ jsonbuf_add_databases(struct jsonbuf *jp)
 		{
 			char *owner_uri = evhttp_encode_uri(((Form_pg_authid) GETSTRUCT(utup))->rolname.data);
 			ReleaseSysCache(utup);
-			jsonbuf_element_link(jp, "owner", ROLE_METADATA_TYPE, psprintf("/roles/%s", owner_uri));
+			jsonbuf_element_link(jp, "owner", ROLE_METADATA_TYPE_V1, psprintf("/roles/%s", owner_uri));
 			free(owner_uri);
 		}
 
@@ -101,7 +101,7 @@ jsonbuf_add_databases(struct jsonbuf *jp)
 		{
 			char *ts_uri = evhttp_encode_uri(((Form_pg_tablespace) GETSTRUCT(tstup))->spcname.data);
 			ReleaseSysCache(tstup);
-			jsonbuf_element_link(jp, "default_tablespace", ROLE_METADATA_TYPE, psprintf("/roles/%s", ts_uri));
+			jsonbuf_element_link(jp, "default_tablespace", ROLE_METADATA_TYPE_V1, psprintf("/roles/%s", ts_uri));
 			free(ts_uri);
 		}
 

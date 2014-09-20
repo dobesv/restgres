@@ -15,10 +15,18 @@
 
 struct restgres_route routes[] = {
 		{
-				"root",
+				"root.json",
 				"/",
 				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
-				SERVER_METADATA_TYPE,
+				JSON_TYPE,
+				NULL,
+				root_route_GET,
+		},
+		{
+				"root.spec",
+				"/",
+				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				SERVER_METADATA_TYPE_V1,
 				NULL,
 				root_route_GET,
 		},
@@ -26,7 +34,7 @@ struct restgres_route routes[] = {
 				"databases",
 				"/databases",
 				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
-				DATABASE_LIST_TYPE,
+				DATABASE_LIST_TYPE_V1,
 				NULL,
 				databases_route_GET,
 		},
@@ -34,7 +42,7 @@ struct restgres_route routes[] = {
 				"database",
 				"/db/{dbname}",
 				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
-				DATABASE_LIST_TYPE,
+				DATABASE_LIST_TYPE_V1,
 				NULL,
 				db_route_GET,
 		}
@@ -158,7 +166,7 @@ match_route(struct restgres_route *route, struct restgres_request *req)
 
 	/* TODO Check the accept and content-type headers */
 
-	return 1;
+	return score;
 }
 
 struct restgres_route *
@@ -174,6 +182,7 @@ find_best_route(struct restgres_request *req)
 		if(score > best_score)
 		{
 			best_route = route;
+			best_score = score;
 		}
 	}
 	return best_route;

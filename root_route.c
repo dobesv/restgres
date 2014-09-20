@@ -39,9 +39,10 @@ root_route_GET(struct restgres_request *req)
 	jsonbuf_member_cstring(jp, "version", PG_VERSION_STR);
 
 	jsonbuf_member_start_array(jp, "links");
-	jsonbuf_element_link(jp, "tablespaces", TABLESPACE_LIST_TYPE, "/tablespaces");
-	jsonbuf_element_link(jp, "databases", DATABASE_LIST_TYPE, "/databases");
-	jsonbuf_element_link(jp, "roles", ROLE_LIST_TYPE, "/roles");
+	jsonbuf_element_link(jp, "self", SERVER_METADATA_TYPE_V1, "/");
+	jsonbuf_element_link(jp, "tablespaces", TABLESPACE_LIST_TYPE_V1, "/tablespaces");
+	jsonbuf_element_link(jp, "databases", DATABASE_LIST_TYPE_V1, "/databases");
+	jsonbuf_element_link(jp, "roles", ROLE_LIST_TYPE_V1, "/roles");
 	jsonbuf_end_array(jp);
 
 	jsonbuf_end_document(jp);
