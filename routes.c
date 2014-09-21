@@ -156,10 +156,11 @@ match_route(struct restgres_route *route, struct restgres_request *req)
 {
 	int score;
 
-	/* Check method */
+	/* Check method - req->cmd_type should have just one bit set but route->cmd_type is a mask */
 	if((req->cmd_type & route->cmd_type) == 0)
 		return -1;
 
+	/* Now check to make sure the path matches the path pattern */
 	score = match_route_uri_pattern(evhttp_uri_get_path(req->uri), route->pattern);
 	if(score < 0)
 		return -1;
