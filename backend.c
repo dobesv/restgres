@@ -195,7 +195,7 @@ void restgres_backend_main(Datum main_arg)
 	}
 
 	BackgroundWorkerInitializeConnection(dbname, username);
-	elog(LOG, "restgres backend worker initialized, pid = %d, user = %s, dbname = %s", getpid(), dbname, username);
+	elog(LOG, "restgres backend worker initialized, pid = %d, username = %s, dbname = %s", getpid(), username, dbname);
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate

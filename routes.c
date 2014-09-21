@@ -55,8 +55,6 @@ match_route_uri_pattern(const char *path_input, const char *path_pattern)
 {
 	while(*path_input && *path_pattern)
 	{
-		if(*path_pattern != *path_input)
-			return -1;
 		if(*path_pattern == '{')
 		{
 			char looking_for;
@@ -76,6 +74,8 @@ match_route_uri_pattern(const char *path_input, const char *path_pattern)
 		}
 		else
 		{
+			if(*path_pattern != *path_input)
+				return -1;
 			path_pattern++;
 			path_input++;
 		}
