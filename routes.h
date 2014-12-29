@@ -13,6 +13,8 @@ struct restgres_request
 	int status_code;
 	pgsocket reply_fd;
 	const char *http_ver;
+	const char *dbname;
+	const char *username;
 	enum evhttp_cmd_type cmd_type;
 	struct evhttp_uri *uri;
 	struct evkeyvalq *headers;
@@ -49,30 +51,6 @@ struct restgres_route
 extern struct restgres_route routes[];
 extern int num_routes;
 
-int
-match_route(struct restgres_route *route, struct restgres_request *req);
-
-struct restgres_route *
-find_best_route(struct restgres_request *req);
-
-void
-parse_route_uri_pattern(const char *path_input, const char *path_pattern, struct evkeyvalq *matchdict);
-
-void
-jsonbuf_add_databases(struct jsonbuf *jp);
-void
-jsonbuf_add_roles(struct jsonbuf *jp);
-
-/* Handler function declarations */
-void
-root_route_GET(struct restgres_request *req);
-void
-databases_route_GET(struct restgres_request *req);
-void
-db_route_GET(struct restgres_request *req);
-void
-roles_route_GET(struct restgres_request *req);
-void
-role_route_GET(struct restgres_request *req);
+#include "route_funcs.h"
 
 #endif /* ROUTES_H_ */

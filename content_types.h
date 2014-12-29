@@ -11,7 +11,7 @@
 #define PG_MIME_JSON_V1(x) "application/vnd.postgresl-" #x "-v1+json;charset=utf8"
 #define SERVER_METADATA_TYPE_V1 PG_MIME_JSON_V1(server)
 #define DATABASE_LIST_TYPE_V1 PG_MIME_JSON_V1(databases)
-#define DATABASE_METADATA_V1_TYPE PG_MIME_JSON_V1(database)
+#define DATABASE_METADATA_TYPE_V1 PG_MIME_JSON_V1(database)
 #define TABLESPACE_LIST_TYPE_V1 PG_MIME_JSON_V1(databases)
 #define TABLESPACE_METADATA_TYPE_V1 PG_MIME_JSON_V1(database)
 #define ROLE_LIST_TYPE_V1 PG_MIME_JSON_V1(roles)

@@ -155,6 +155,8 @@ void restgres_backend_main(Datum main_arg)
 			0,
 			-1,
 			NULL,
+			NULL,
+			NULL,
 			0,
 			NULL,
 			&request_headers,
@@ -193,6 +195,8 @@ void restgres_backend_main(Datum main_arg)
 		elog(FATAL, "Failed to read database and username from master");
 		proc_exit(1);
 	}
+	req.dbname = dbname;
+	req.username = username;
 
 	BackgroundWorkerInitializeConnection(dbname, username);
 	elog(LOG, "restgres backend worker initialized, pid = %d, username = %s, dbname = %s", getpid(), username, dbname);

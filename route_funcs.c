@@ -61,16 +61,16 @@ match_route_uri_pattern(const char *path_input, const char *path_pattern)
 void
 parse_route_uri_pattern(const char *path_input, const char *path_pattern, struct evkeyvalq *matchdict)
 {
-	char keybuf[32];
+	char  keybuf[32];
 	char *kp;
-	char valbuf[512];
+	char  valbuf[512];
 	char *vp;
+	char  looking_for;
+	char *val_decoded;
 	while(*path_input && *path_pattern)
 	{
 		if(*path_pattern == '{')
 		{
-			char looking_for;
-
 			path_pattern++;
 			kp = keybuf;
 			while(*path_pattern && *path_pattern != '}')
@@ -111,7 +111,11 @@ parse_route_uri_pattern(const char *path_input, const char *path_pattern, struct
 				*vp = 0;
 				/* Save the value if the key is non-empty */
 				if(keybuf[0])
-					evhttp_add_header(matchdict, keybuf, valbuf);
+				{
+					val_decoded = evhttp_uridecode(valbuf, 1, NULL);
+					evhttp_add_header(matchdict, keybuf, val_decoded);
+					free(val_decoded);
+				}
 			}
 
 		}

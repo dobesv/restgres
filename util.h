@@ -191,4 +191,12 @@ getpeerpideid(int sock, pid_t *pid, uid_t *uid, gid_t *gid);
 void
 add_json_content_type_header(struct evkeyvalq *headers);
 
+/*
+ * Appends a path component to an existing path.  The "ext" is URL escaped and the result
+ * is joined to the "base" with a "/" in between.  The result is allocated using palloc().
+ *
+ */
+const char *
+pstr_uri_append_path_component(const char *base, const char *ext);
+
 #endif /* RESTGRES_EVUTIL_H_ */

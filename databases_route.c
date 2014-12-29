@@ -37,6 +37,8 @@
 void
 jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform);
 
+void
+jsonbuf_add_databases(struct jsonbuf *jp);
 
 void
 jsonbuf_add_databases(struct jsonbuf *jp)

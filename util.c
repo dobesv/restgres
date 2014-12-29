@@ -602,10 +602,21 @@ evbuffer_parse_scgi_headers(struct evbuffer *input, struct evkeyvalq *headers)
 			break;
 		evhttp_add_header(headers, key, value);
 		/* elog(LOG, "Got header; %s: %s", key, value); */
+		pfree(value);
 	}
 	if(evbuffer_get_length(input) != 0)
 	{
 		return -1;
 	}
 	return 0;
+}
+
+const char *
+pstr_uri_append_path_component(const char *base, const char *ext)
+{
+
+	char *ext_uri = evhttp_uriencode(ext, strlen(ext), 1);
+	const char *result = psprintf("%s/%s", base, ext_uri);
+	free(ext_uri);
+	return result;
 }
