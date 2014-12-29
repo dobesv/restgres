@@ -60,6 +60,8 @@ parse_route_uri_pattern(const char *path_input, const char *path_pattern, struct
 
 void
 jsonbuf_add_databases(struct jsonbuf *jp);
+void
+jsonbuf_add_roles(struct jsonbuf *jp);
 
 /* Handler function declarations */
 void
@@ -68,5 +70,9 @@ void
 databases_route_GET(struct restgres_request *req);
 void
 db_route_GET(struct restgres_request *req);
+void
+roles_route_GET(struct restgres_request *req);
+void
+role_route_GET(struct restgres_request *req);
 
 #endif /* ROUTES_H_ */

@@ -115,6 +115,7 @@ void _PG_init(void)
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS
 			| BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
+
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_main = restgres_main;
 	worker.bgw_notify_pid = 0;

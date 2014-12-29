@@ -45,8 +45,8 @@ jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform)
 	HeapTuple	utup;
 	HeapTuple	tstup;
 
-	jsonbuf_member_cstring(jp, "name", dbform->datname.data);
-	jsonbuf_member_cstring(jp, "oid", psprintf("%ud", oid));
+	jsonbuf_member_cstring(jp, "name", NameStr(dbform->datname));
+	jsonbuf_member_cstring(jp, "oid", psprintf("%u", oid));
 	jsonbuf_member_cstring(jp, "encoding", pg_encoding_to_char(dbform->encoding));
 	jsonbuf_member_cstring(jp, "collate", dbform->datcollate.data);
 	jsonbuf_member_cstring(jp, "ctype", dbform->datctype.data);
@@ -55,7 +55,7 @@ jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform)
 	jsonbuf_member_int(jp, "connlimit", dbform->datconnlimit);
 
 	jsonbuf_member_start_array(jp, "links");
-	datname_uri = evhttp_encode_uri(dbform->datname.data);
+	datname_uri = evhttp_encode_uri(NameStr(dbform->datname));
 	jsonbuf_element_link(jp, "self", DATABASE_METADATA_V1_TYPE, psprintf("/db/%s", datname_uri));
 	free(datname_uri);
 
