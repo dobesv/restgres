@@ -61,7 +61,6 @@ jsonbuf_add_role_info(struct jsonbuf *jp, Oid oid, Form_pg_authid form)
 
 }
 
-/* When we get here, the role we are asking about is the one we are connected to ... */
 void
 role_route_GET(struct restgres_request *req)
 {

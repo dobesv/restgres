@@ -199,4 +199,18 @@ add_json_content_type_header(struct evkeyvalq *headers);
 const char *
 pstr_uri_append_path_component(const char *base, const char *ext);
 
+struct jsonbuf;
+
+/*
+ * Add a link json object for a role
+ */
+void
+jsonbuf_element_role_link(struct jsonbuf *jp, const char *key, Oid roleOid);
+
+/*
+ * Add a link json object for a tablespace
+ */
+void
+jsonbuf_add_tablespace_link(struct jsonbuf* jp, const char *key, Oid tablespaceOid);
+
 #endif /* RESTGRES_EVUTIL_H_ */

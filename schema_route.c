@@ -40,28 +40,18 @@ jsonbuf_add_schema_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_na
 void
 jsonbuf_add_schema_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_namespace form)
 {
-	HeapTuple	utup;
-
 	jsonbuf_member_cstring(jp, "name", NameStr(form->nspname));
 	jsonbuf_member_cstring(jp, "oid", psprintf("%u", oid));
 
 	jsonbuf_member_start_array(jp, "links");
 	jsonbuf_element_link(jp, "self", SCHEMA_METADATA_TYPE_V1, uri);
 
-	utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(form->nspowner));
-	if (HeapTupleIsValid(utup))
-	{
-		char *owner_uri = evhttp_encode_uri(((Form_pg_authid) GETSTRUCT(utup))->rolname.data);
-		ReleaseSysCache(utup);
-		jsonbuf_element_link(jp, "owner", ROLE_METADATA_TYPE_V1, psprintf("/roles/%s", owner_uri));
-		free(owner_uri);
-	}
+	jsonbuf_element_role_link(jp, "owner", form->nspowner);
+	jsonbuf_element_link(jp, "tables", TABLE_METADATA_TYPE_V1, pstr_uri_append_path_component(uri, "tables"));
 
 	jsonbuf_end_array(jp);
-
 }
 
-/* When we get here, the schema we are asking about is the one we are connected to ... */
 void
 schema_route_GET(struct restgres_request *req)
 {

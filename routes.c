@@ -78,6 +78,22 @@ struct restgres_route routes[] = {
 				NULL,
 				schema_route_GET,
 		},
+		{
+				"tables",
+				"/db/{dbname}/schemas/{schemaname}/tables",
+				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				TABLE_LIST_TYPE_V1,
+				NULL,
+				tables_route_GET,
+		},
+		{
+				"table",
+				"/db/{dbname}/schemas/{schemaname}/tables/{tablename}",
+				EVHTTP_REQ_GET | EVHTTP_REQ_HEAD,
+				TABLE_METADATA_TYPE_V1,
+				NULL,
+				table_route_GET,
+		},
 
 };
 

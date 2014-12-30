@@ -37,13 +37,10 @@
 void
 jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform);
 
-
 void
 jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform)
 {
 	char       *datname_uri;
-	HeapTuple	utup;
-	HeapTuple	tstup;
 
 	jsonbuf_member_cstring(jp, "name", NameStr(dbform->datname));
 	jsonbuf_member_cstring(jp, "oid", psprintf("%u", oid));
@@ -60,23 +57,8 @@ jsonbuf_add_database_info(struct jsonbuf *jp, Oid oid, Form_pg_database dbform)
 	jsonbuf_element_link(jp, "schemas", SCHEMA_LIST_TYPE_V1, psprintf("/db/%s/schemas", datname_uri));
 	free(datname_uri);
 
-	utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(dbform->datdba));
-	if (HeapTupleIsValid(utup))
-	{
-		char *owner_uri = evhttp_encode_uri(((Form_pg_authid) GETSTRUCT(utup))->rolname.data);
-		ReleaseSysCache(utup);
-		jsonbuf_element_link(jp, "owner", ROLE_METADATA_TYPE_V1, psprintf("/roles/%s", owner_uri));
-		free(owner_uri);
-	}
-
-	tstup = SearchSysCache1(TABLESPACEOID, dbform->dattablespace);
-	if(HeapTupleIsValid(tstup))
-	{
-		char *ts_uri = evhttp_encode_uri(((Form_pg_tablespace) GETSTRUCT(tstup))->spcname.data);
-		ReleaseSysCache(tstup);
-		jsonbuf_element_link(jp, "default_tablespace", ROLE_METADATA_TYPE_V1, psprintf("/tablespaces/%s", ts_uri));
-		free(ts_uri);
-	}
+	jsonbuf_element_role_link(jp, "owner", dbform->datdba);
+	jsonbuf_add_tablespace_link(jp, "default_tablespace", dbform->dattablespace);
 
 	/* TODO Include ACL */
 

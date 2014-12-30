@@ -22,9 +22,18 @@
 
 #include <event2/keyvalq_struct.h>
 
+#include <access/htup.h>
+#include <access/htup_details.h>
+#include <utils/syscache.h>
+#include "catalog/pg_database.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_tablespace.h"
+
 #include "lib/stringinfo.h"
 
 #include "util.h"
+#include "content_types.h"
+#include "jsonbuf.h"
 
 static ssize_t
 evbuffer_netstring_available(struct evbuffer *input, ssize_t *offset_out, ssize_t *length_out);
@@ -620,3 +629,29 @@ pstr_uri_append_path_component(const char *base, const char *ext)
 	free(ext_uri);
 	return result;
 }
+
+void
+jsonbuf_element_role_link(struct jsonbuf *jp, const char *rel, Oid roleOid)
+{
+	HeapTuple utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleOid));
+	if (HeapTupleIsValid(utup))
+	{
+		jsonbuf_element_link(jp, rel, ROLE_METADATA_TYPE_V1,
+				pstr_uri_append_path_component("/roles", NameStr(((Form_pg_authid) GETSTRUCT(utup))->rolname)));
+		ReleaseSysCache(utup);
+	}
+
+}
+
+void
+jsonbuf_add_tablespace_link(struct jsonbuf* jp, const char *rel, Oid tablespaceOid)
+{
+	HeapTuple tstup = SearchSysCache1(TABLESPACEOID, tablespaceOid);
+	if (HeapTupleIsValid(tstup))
+	{
+		jsonbuf_element_link(jp, rel, ROLE_METADATA_TYPE_V1,
+				pstr_uri_append_path_component("/tablespaces", NameStr(((Form_pg_tablespace) GETSTRUCT(tstup))->spcname)));
+		ReleaseSysCache(tstup);
+	}
+}
+

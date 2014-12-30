@@ -62,6 +62,10 @@ jsonbuf_add_schemas(struct jsonbuf *jp, const char *uri)
 
 		oid = HeapTupleGetOid(tuple);
 
+		// System catalog namespaces can go elsewhere
+		if(oid == PG_CATALOG_NAMESPACE || oid == PG_TOAST_NAMESPACE)
+			continue;
+
 		jsonbuf_element_start_object(jp);
 
 		jsonbuf_add_schema_info(jp, oid, schema_uri, form);
