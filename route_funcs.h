@@ -36,5 +36,9 @@ void
 tables_route_GET(struct restgres_request *req);
 void
 table_route_GET(struct restgres_request *req);
+void
+table_rows_route_GET(struct restgres_request *req);
+void
+table_row_route_GET(struct restgres_request *req);
 
 #endif /* ROUTE_FUNCS_H_ */
