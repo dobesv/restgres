@@ -196,7 +196,7 @@ add_json_content_type_header(struct evkeyvalq *headers);
  * is joined to the "base" with a "/" in between.  The result is allocated using palloc().
  *
  */
-const char *
+char *
 pstr_uri_append_path_component(const char *base, const char *ext);
 
 struct jsonbuf;

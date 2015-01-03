@@ -17,12 +17,14 @@
 #include "tcop/utility.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
 #include "catalog/indexing.h"
 #include "utils/fmgroids.h"
 #include "access/htup_details.h"
 #include "storage/lmgr.h"
 #include "mb/pg_wchar.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
 
 #include <event2/http.h>
 #include <event2/util.h>
@@ -36,10 +38,54 @@
 void
 jsonbuf_add_table_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_class form);
 
+void
+jsonbuf_add_column_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_attribute form);
+
+void
+jsonbuf_add_column_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_attribute form)
+{
+	char *typeUri;
+	HeapTuple typeTup = NULL;
+	Form_pg_type typeForm = NULL;
+
+	jsonbuf_member_cstring(jp, "name", NameStr(form->attname));
+
+	if(OidIsValid(form->atttypid) && HeapTupleIsValid(typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(form->atttypid)))) {
+		typeForm = (Form_pg_type) GETSTRUCT(typeTup);
+		jsonbuf_member_cstring(jp, "type", NameStr(typeForm->typname));
+	}
+
+	jsonbuf_member_bool(jp, "notnull", form->attnotnull);
+	if(form->attlen > 0)
+		jsonbuf_member_int(jp, "length", form->attlen);
+
+	jsonbuf_member_start_array(jp, "links");
+	jsonbuf_element_link(jp, "self", TABLE_COLUMN_METADATA_TYPE_V1, uri);
+	if(typeForm != NULL) {
+		typeUri = pstr_uri_append_path_component("/types", NameStr(typeForm->typname));
+		jsonbuf_element_link(jp, "type", TYPE_METADATA_TYPE_V1, typeUri);
+		pfree(typeUri);
+		ReleaseSysCache(typeTup);
+	}
+
+	jsonbuf_end_array(jp);
+}
 
 void
 jsonbuf_add_table_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_class form)
 {
+	Relation	arel;
+	ScanKeyData akey[2];
+	SysScanDesc ascan;
+	HeapTuple	atup;
+	Form_pg_attribute attForm;
+	char *columnUri;
+	char *columnsUri;
+	char *rowsUri;
+
+	columnsUri = psprintf("%s/columns", uri);
+	rowsUri = psprintf("%s/rows", uri);
+
 	jsonbuf_member_cstring(jp, "name", NameStr(form->relname));
 	jsonbuf_member_cstring(jp, "oid", psprintf("%u", oid));
 
@@ -71,11 +117,46 @@ jsonbuf_add_table_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_cla
 	default: break;
 	}
 
-	jsonbuf_member_start_array(jp, "links");
-	jsonbuf_element_link(jp, "self", SCHEMA_METADATA_TYPE_V1, uri);
+	jsonbuf_member_start_array(jp, "columns");
 
+
+	arel = heap_open(AttributeRelationId, AccessShareLock);
+
+	ScanKeyInit(&akey[0],
+				Anum_pg_attribute_attrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(oid));
+	ScanKeyInit(&akey[1],
+			    Anum_pg_attribute_attnum,
+			    BTGreaterStrategyNumber, F_INT2GT,
+			    Int16GetDatum(0));
+
+	ascan = systable_beginscan(arel, AttributeRelidNumIndexId, true, NULL, 2, akey);
+
+	while (HeapTupleIsValid(atup = systable_getnext(ascan)))
+	{
+		attForm = (Form_pg_attribute) GETSTRUCT(atup);
+		columnUri = pstr_uri_append_path_component(columnsUri, NameStr(attForm->attname));
+		jsonbuf_element_start_object(jp);
+		jsonbuf_add_column_info(jp, HeapTupleGetOid(atup), columnUri, attForm);
+		jsonbuf_end_object(jp);
+		pfree(columnUri);
+	}
+
+	systable_endscan(ascan);
+	heap_close(arel, AccessShareLock);
+
+	jsonbuf_end_array(jp);
+
+	jsonbuf_member_start_array(jp, "links");
+	jsonbuf_element_link(jp, "self", TABLE_METADATA_TYPE_V1, uri);
+	if(OidIsValid(form->reltype))
+		jsonbuf_element_link(jp, "columns", TABLE_COLUMN_LIST_TYPE_V1, columnsUri);
+	jsonbuf_element_link(jp, "rows", TABLE_ROW_LIST_TYPE_V1, rowsUri);
 	jsonbuf_element_role_link(jp, "owner", form->relowner);
 	jsonbuf_add_tablespace_link(jp, "tablespace", form->reltablespace);
+
+	jsonbuf_end_array(jp);
 
 	// TODO reltype, reloftype, relam, relfilename, relnatts
 
@@ -101,7 +182,8 @@ jsonbuf_add_table_info(struct jsonbuf *jp, Oid oid, const char *uri, Form_pg_cla
 
 	// TODO acl's ?
 
-	jsonbuf_end_array(jp);
+	pfree(columnsUri);
+
 }
 
 void
@@ -110,34 +192,34 @@ table_route_GET(struct restgres_request *req)
 	struct jsonbuf *jp = req->jsonbuf;
 	const char     *tablename = evhttp_find_header(req->matchdict, "tablename");
 	const char     *schemaname = evhttp_find_header(req->matchdict, "schemaname");
-	HeapTuple       schematup = SearchSysCache1(NAMESPACENAME, PointerGetDatum(schemaname));
-	HeapTuple       tabletup = SearchSysCache1(NAMESPACENAME, PointerGetDatum(tablename));
+	Oid             schemaOid = GetSysCacheOid1(NAMESPACENAME, PointerGetDatum(schemaname));
+	HeapTuple       tabletup;
 	Form_pg_class   form;
 
-	if (!HeapTupleIsValid(schematup))
+	if (!OidIsValid(schemaOid))
 	{
 		elog(ERROR, "lookup failed for schema '%s' in database '%s'", schemaname, evhttp_find_header(req->matchdict, "dbname"));
 		req->status_code = 404;
+		return;
 	}
-	else if (!HeapTupleIsValid(tabletup))
+
+	tabletup = SearchSysCache2(RELNAMENSP, PointerGetDatum(tablename), ObjectIdGetDatum(schemaOid));
+	if (!HeapTupleIsValid(tabletup))
 	{
-		elog(ERROR, "lookup failed for table '%s' in database '%s'", tablename, evhttp_find_header(req->matchdict, "dbname"));
+		elog(ERROR, "lookup failed for table '%s' in schema '%s' in database '%s'", tablename, schemaname, evhttp_find_header(req->matchdict, "dbname"));
 		req->status_code = 404;
+		return;
 	}
-	else
-	{
-		form = (Form_pg_class) GETSTRUCT(tabletup);
+	form = (Form_pg_class) GETSTRUCT(tabletup);
 
-		add_json_content_type_header(req->reply_headers);
-		jsonbuf_start_document(jp);
-		jsonbuf_member_start_object(jp, "table");
+	add_json_content_type_header(req->reply_headers);
+	jsonbuf_start_document(jp);
+	jsonbuf_member_start_object(jp, "table");
 
-		jsonbuf_add_table_info(jp, HeapTupleGetOid(tabletup), evhttp_uri_get_path(req->uri), form);
+	jsonbuf_add_table_info(jp, HeapTupleGetOid(tabletup), evhttp_uri_get_path(req->uri), form);
 
-		jsonbuf_end_object(jp);
-		jsonbuf_end_document(jp);
-	}
+	jsonbuf_end_object(jp);
+	jsonbuf_end_document(jp);
 
-	if(HeapTupleIsValid(tabletup)) ReleaseSysCache(tabletup);
-	if(HeapTupleIsValid(schematup)) ReleaseSysCache(schematup);
+	ReleaseSysCache(tabletup);
 }
